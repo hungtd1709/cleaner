@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Cleaner app icon: a paint brush on a dark tile. The tile follows the macOS icon grid
+       (824 px square, centred). Render with `cargo xtask icons`. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2A2F3C"/>
+      <stop offset="0.55" stop-color="#171A21"/>
+      <stop offset="1" stop-color="#0C0E12"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.03"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="300" cy="720" r="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3DD6C4" stop-opacity="0.30"/>
+      <stop offset="0.6" stop-color="#8B5CF6" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="handle" x1="468" y1="0" x2="556" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.5" stop-color="#E3E6ED"/>
+      <stop offset="1" stop-color="#A9B0BE"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="452" y1="0" x2="572" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F1F3F7"/>
+      <stop offset="0.45" stop-color="#BFC5D0"/>
+      <stop offset="1" stop-color="#788091"/>
+    </linearGradient>
+    <linearGradient id="bristles" x1="0" y1="648" x2="0" y2="884" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3DD6C4"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <clipPath id="tile-clip">
+      <rect x="100" y="100" width="824" height="824" rx="186"/>
+    </clipPath>
+    <filter id="blur-lg" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <filter id="blur-sm" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+
+  <!-- Tile with a soft shadow -->
+  <rect x="112" y="130" width="800" height="800" rx="180" fill="#000000" opacity="0.38" filter="url(#blur-lg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tile)"/>
+
+  <g clip-path="url(#tile-clip)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
+    <!-- The swept path left behind by the brush -->
+    <path d="M 206 806 C 330 872 520 868 712 772" fill="none" stroke="#3DD6C4" stroke-opacity="0.30"
+          stroke-width="24" stroke-linecap="round"/>
+    <path d="M 252 858 C 380 902 540 896 664 846" fill="none" stroke="#8B5CF6" stroke-opacity="0.22"
+          stroke-width="14" stroke-linecap="round"/>
+
+    <!-- The brush, drawn upright and turned 45 degrees -->
+    <g transform="rotate(45 512 512)">
+      <g opacity="0.45" filter="url(#blur-sm)" transform="translate(18 10)">
+        <rect x="468" y="150" width="88" height="420" rx="44" fill="#000000"/>
+        <path d="M 448 548 L 576 548 L 576 648 C 594 700 606 770 596 826 Q 586 880 512 884 Q 438 880 428 826 C 418 770 430 700 448 648 Z" fill="#000000"/>
+      </g>
+      <rect x="468" y="150" width="88" height="420" rx="44" fill="url(#handle)"/>
+      <circle cx="512" cy="208" r="13" fill="#0E1014" opacity="0.55"/>
+      <rect x="452" y="548" width="120" height="104" rx="16" fill="url(#metal)"/>
+      <rect x="452" y="575" width="120" height="7" fill="#4E5563" opacity="0.55"/>
+      <rect x="452" y="613" width="120" height="7" fill="#4E5563" opacity="0.55"/>
+      <path d="M 448 648 L 576 648 C 594 700 606 770 596 826 Q 586 880 512 884 Q 438 880 428 826 C 418 770 430 700 448 648 Z"
+            fill="url(#bristles)"/>
+      <path d="M 484 664 L 478 856 M 512 664 L 512 868 M 540 664 L 546 856" stroke="#0E1014" stroke-opacity="0.20"
+            stroke-width="5" stroke-linecap="round" fill="none"/>
+      <path d="M 462 666 C 452 726 448 780 458 830" stroke="#FFFFFF" stroke-opacity="0.38" stroke-width="9"
+            stroke-linecap="round" fill="none"/>
+    </g>
+
+    <!-- Sparkles -->
+    <path d="M 300 236 Q 312 312 388 324 Q 312 336 300 412 Q 288 336 212 324 Q 288 312 300 236 Z" fill="#EAFFFB"/>
+    <path d="M 414 192 Q 420 230 458 236 Q 420 242 414 280 Q 408 242 370 236 Q 408 230 414 192 Z" fill="#B6F2EA" opacity="0.92"/>
+    <path d="M 768 676 Q 774 712 810 718 Q 774 724 768 760 Q 762 724 726 718 Q 762 712 768 676 Z" fill="#CDBDFF" opacity="0.92"/>
+  </g>
+
+  <!-- A thin light rim on the tile edge -->
+  <rect x="101" y="101" width="822" height="822" rx="185" fill="none" stroke="url(#rim)" stroke-width="2"/>
+</svg>
