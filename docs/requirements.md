@@ -6,20 +6,23 @@ The design that meets these requirements is in [solution.md](solution.md).
 
 ## 1. What the app cleans
 
-**Default rule:** an item starts selected only if apps can re-create it at no real cost and the app that owns it is not running.
+**Default rule:** an item starts selected only if apps can re-create it at no real cost and its app is not in use. An app is in use while it runs. Browser and app-data caches also count as in use if they changed in the last 15 minutes.
 
 | Category | macOS | Windows | Action | Default |
 |---|---|---|---|---|
 | System junk | Third-party `~/Library/Caches/*`; logs and crash reports older than 7 days; `$TMPDIR` items older than 7 days | `%TEMP%` items older than 7 days; `CrashDumps` and `WER` older than 7 days; `INetCache` | Delete | Selected |
 | Optional system caches | `com.apple.*` caches that are not on the deny list | DirectX shader cache | Delete | Unselected |
 | Browser caches | Cache folders of Chrome, Edge, Brave, Firefox, Safari | Cache, Code Cache, GPUCache and `cache2` of Chrome, Edge, Brave, Firefox; all profiles | Delete | Selected |
-| Developer caches | Xcode DerivedData, iOS DeviceSupport, simulator caches; npm, Yarn, pip, Homebrew, CocoaPods, Cargo, Go, Gradle; `~/.cache/*` | npm, Yarn, pip, NuGet HTTP cache, Cargo, Go, Gradle; `.cache\*` | Delete | Unselected: rebuilds and downloads cost time |
+| App data: Electron caches | One item per app that keeps Chromium caches (`Code Cache`, `GPUCache`, `Cache` and similar) in `~/Library/Application Support/<App>` | The same, in `%APPDATA%` and `%LOCALAPPDATA%` | Delete | Selected |
+| App data: Claude | Old Claude Code versions, except the newest and the one `claude` starts. Claude Code sessions older than `cleanupPeriodDays` (30 days by default). Old Claude Desktop components. The Cowork VM image, about 10 GB. | same | Delete | Old versions selected; sessions and the VM image unselected |
+| Developer caches | Xcode DerivedData, iOS DeviceSupport, simulator caches; npm, Yarn, Yarn Berry, pnpm, Bun, pip, Homebrew, CocoaPods, Cargo, Go, Gradle, NuGet, Maven, Composer, Dart, Android; `~/.cache/*` | npm, Yarn, Yarn Berry, pnpm, Bun, pip, uv, Poetry, Cargo, Go, Gradle, NuGet, Maven, Composer, Dart, Deno, Android, Playwright, Electron; `.cache\*` | Delete | Unselected: rebuilds and downloads cost time |
 | Xcode Archives | `~/Library/Developer/Xcode/Archives/*` | — | Move to Trash | Unselected |
-| Project build folders | `node_modules` next to a `package.json`; folders marked with a `CACHEDIR.TAG` file, such as a Rust `target` folder. Each shows the days since its last change. | same | Delete | Unselected |
+| Project build folders | `node_modules` next to a `package.json`, and folders marked with a `CACHEDIR.TAG` file, such as a Rust `target` folder. Only in the user's own folders (rule S13), so never inside a VS Code extension. Each shows when its project last changed. | same | Delete | Unselected; a button selects projects idle for 30+ days |
 | Trash | `~/.Trash` | Recycle Bin on all drives | Empty | Unselected |
-| Large files | Files and bundles in the home folder of 500 MB or more. A menu sets the limit from 100 MB to 5 GB. | same | Move to Trash | Unselected |
+| Large files | The user's own files and bundles of 500 MB or more (rule S13). A menu sets the limit from 100 MB to 5 GB. | same | Move to Trash | Unselected |
 | Old Downloads | Items in Downloads not added or changed for 90 days or more. Hidden files such as `.DS_Store` are ignored. | same | Move to Trash | Unselected |
-| Duplicates | Identical files of 1 MB or more in the home folder. The search runs only on request. | same | Move to Trash | Unselected; a helper selects all copies but the oldest |
+| Installers | Files at the top of Downloads, of any age: `.dmg`, `.pkg`, `.msi`, `.msix`, `.appx`, setup `.exe`, and zips that hold an app or installer | same | Move to Trash | Unselected |
+| Duplicates | Identical files of 1 MB or more among the user's own files (rule S13). Every match is checked byte by byte. The search runs only on request. | same | Move to Trash | Unselected; a helper selects all copies but the oldest |
 
 Some items are listed so the user knows about them, but they can never be selected:
 
@@ -35,14 +38,21 @@ Some items are listed so the user knows about them, but they can never be select
 | F2 | One **Scan** button scans all categories. Sizes update while the scan runs. **Cancel** stops the scan. |
 | F3 | The sidebar lists the categories. Each shows its total size and a checkbox. |
 | F4 | The main panel lists the items of the chosen category, biggest first. Each row shows a checkbox, name, size, last change and path. |
-| F5 | **Reveal** opens Finder or File Explorer at an item. |
-| F6 | The footer shows the size and count of selected items, and a **Clean** button. |
+| F5 | **Show** opens Finder or File Explorer at an item. |
+| F6 | The footer shows the size and count of selected items, and a **Clean** button. A file listed in two categories counts once. |
 | F7 | Clean asks for confirmation. The dialog shows size, count, and which items are deleted and which go to the Trash. |
 | F8 | After cleaning, the app shows the bytes removed and the measured change in free space. It lists each skipped item with a reason. |
 | F9 | The large-file limit is a menu. A change filters the list at once, with no new scan. |
 | F10 | **Find duplicates** runs only when the user clicks it. Groups are sorted by wasted space. |
-| F11 | Items of a running app start unselected and show a "running" label. |
-| F12 | macOS: items blocked by privacy protection show "Needs Full Disk Access". A button opens that settings page. |
+| F11 | Items of an app in use start unselected and show "in use — quit the app first". |
+| F12 | macOS: items blocked by privacy protection show "needs Full Disk Access". A button opens that settings page. |
+| F13 | **Space map** lists the folders in home, hidden ones included, biggest first. A click opens a folder; a breadcrumb goes back. Each folder shows how much the lists can clean in it, or a tip for known tools. The map never removes anything. |
+| F14 | A search box filters the list by name or path. "Select all" applies to the matching rows. |
+| F15 | Clicking Name, Size or Changed sorts the list. The choice is saved. |
+| F16 | **Preview** shows a file with Quick Look (macOS) or opens it (Windows). Space previews the clicked row. |
+| F17 | After cleaning, **Put back** returns every item that went to the Trash. Deleted caches cannot come back. |
+| F18 | **Never touch:** a right-click on a row, or the Settings dialog, adds a folder or file that Cleaner never lists and never removes. The list and the large-file limit are saved. |
+| F19 | In Build folders, **Select projects idle 30+ days** selects the build folders of projects that have not changed for 30 days. |
 
 ## 3. Safety rules
 
@@ -54,11 +64,13 @@ Some items are listed so the user knows about them, but they can never be select
 | S4 | The app never follows symlinks, junctions or mount points, and never leaves the volume it started on. |
 | S5 | User files (Large files, Old Downloads, Duplicates, Archives) only go to the Trash. If the Trash refuses a file, the app skips it. It never deletes the file instead. |
 | S6 | Cloud files are never read or removed. Sync folders are not walked and cloud-only files are skipped. On macOS, a read of a cloud-only file fails instead of downloading it. |
-| S7 | A bundle (`.app`, `.photoslibrary` and similar) counts as one item; files inside it are never selected. The app never enters `.git` folders. |
+| S7 | A bundle (`.app`, `.photoslibrary` and similar) counts as one item; files inside it are never selected. Nothing inside a `.git` folder is listed; the Space map only measures it. |
 | S8 | A deny list is never shown or removed. See below. |
 | S9 | Items that are in use or not permitted are skipped and reported. One failure never stops the clean. |
 | S10 | In each duplicate group, at least one copy always stays. |
 | S11 | The app makes no network connections and sends no telemetry. |
+| S12 | Paths on the Never touch list are not walked, listed or removed. |
+| S13 | Large files, Duplicates and Build folders come only from the user's own folders. Hidden folders, environments and tool installs are left out. Duplicates also skip Git projects. |
 
 The S8 deny list:
 
@@ -88,15 +100,22 @@ The S8 deny list:
 - Scheduled or background cleaning, a menu-bar helper, auto-update.
 - App uninstaller, Windows registry cleaning, "RAM boosters", start-up items.
 - Linux, an Intel Mac build, paid code signing and notarization, installers (MSI, PKG).
-- Saved settings: limits go back to their defaults at each launch.
 
 ## Terms and short names
 
 | Term | Meaning |
 |---|---|
+| App data | Data that apps keep in their own folders: caches, old versions and old sessions |
 | Bundle | A macOS folder that Finder shows as one file, such as `.app` or `.photoslibrary` |
 | `CACHEDIR.TAG` | A standard file that marks a folder as a cache that is safe to delete |
 | Cloud-only file | A file whose name shows on disk but whose content is still in the cloud. macOS calls it "dataless"; Windows calls it a "placeholder". |
+| Cowork VM | The virtual machine image that Claude Desktop uses for Cowork and code execution |
+| Electron app | A desktop app built on Chromium, such as VS Code, Slack or Claude Desktop |
+| Environment | A folder of installed packages, such as a Python `venv`, `site-packages` or `vendor` |
 | Full Disk Access | A macOS setting that lets one app read folders that privacy protection blocks |
+| Hidden folder | A folder whose name starts with a dot, such as `~/.rustup` |
+| Never touch list | The user's list of folders and files that Cleaner leaves alone |
 | Root | The folder a cleaning rule starts from, such as `~/Library/Caches` |
+| Space map | A read-only view of folder sizes |
 | Target | One cleaning rule: a root, an action and a default selection |
+| Tool install | A tool's own folder in home, such as `~/go` or `~/miniconda3` |

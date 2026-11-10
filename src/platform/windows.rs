@@ -35,8 +35,11 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_Downloads, IsUserAnAdmin, KF_FLAG_DEFAULT, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI,
     SHERB_NOSOUND, SHEmptyRecycleBinW, SHGetKnownFolderPath, SHQUERYRBINFO, SHQueryRecycleBinW,
+    ShellExecuteW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL,
+};
 
 use super::Disk;
 use crate::fmt;
@@ -362,7 +365,7 @@ fn drive_root(path: &Path) -> Option<String> {
 
 /// Moves one item to the Recycle Bin. If the bin refuses it (too big, no bin on the
 /// drive, name problems), the item is skipped. It is never deleted instead (rule S5).
-pub fn move_to_trash(path: &Path) -> Result<(), String> {
+pub fn move_to_trash(path: &Path) -> Result<Option<PathBuf>, String> {
     if let Some(problem) = trash_name_problem(path) {
         return Err(problem.to_owned());
     }
@@ -371,7 +374,90 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
     if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } != DRIVE_FIXED {
         return Err("this drive has no Recycle Bin".to_owned());
     }
-    trash::delete(path).map_err(|e| e.to_string())
+    // The Recycle Bin keeps the original path; `restore_from_trash` finds items by it.
+    trash::delete(path)
+        .map(|()| None)
+        .map_err(|e| e.to_string())
+}
+
+/// Puts items back from the Recycle Bin: those with one of our original paths that
+/// were deleted at or after `since` (seconds since 1970).
+pub fn restore_from_trash(
+    items: &[(PathBuf, Option<PathBuf>)],
+    since: i64,
+) -> Vec<(PathBuf, Result<(), String>)> {
+    use std::collections::HashSet;
+    let wanted: HashSet<String> = items
+        .iter()
+        .map(|(p, _)| fmt::path(p).to_lowercase())
+        .collect();
+    let listed = match trash::os_limited::list() {
+        Ok(listed) => listed,
+        Err(e) => {
+            return items
+                .iter()
+                .map(|(p, _)| (p.clone(), Err(e.to_string())))
+                .collect();
+        }
+    };
+    let (mut found, mut taken) = (HashSet::new(), HashSet::new());
+    let ours: Vec<trash::TrashItem> = listed
+        .into_iter()
+        .filter(|item| item.time_deleted >= since - 5)
+        .filter(|item| {
+            let original = item.original_path();
+            let key = fmt::path(&original).to_lowercase();
+            if !wanted.contains(&key) || !found.insert(key.clone()) {
+                return false;
+            }
+            // `restore_all` restores nothing if one name is taken, so skip those here.
+            if std::fs::symlink_metadata(&original).is_ok() {
+                taken.insert(key);
+                return false;
+            }
+            true
+        })
+        .collect();
+    let result = if ours.is_empty() {
+        Ok(())
+    } else {
+        trash::os_limited::restore_all(ours).map_err(|e| e.to_string())
+    };
+    items
+        .iter()
+        .map(|(p, _)| {
+            let key = fmt::path(p).to_lowercase();
+            let r = match &result {
+                _ if taken.contains(&key) => Err("something else now has its name".to_owned()),
+                Err(e) => Err(e.clone()),
+                Ok(()) if found.contains(&key) => Ok(()),
+                Ok(()) => Err("not found in the Recycle Bin".to_owned()),
+            };
+            (p.clone(), r)
+        })
+        .collect()
+}
+
+/// Opens the file with its default app, as a preview.
+pub fn preview(path: &Path) {
+    let file = wide(fmt::path(path));
+    let verb = wide("open");
+    // SAFETY: valid NUL-terminated strings; no parent window.
+    unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// Where settings live: `%APPDATA%\Cleaner`.
+pub fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Cleaner"))
 }
 
 pub fn empty_trash_with_finder() -> Result<(), String> {

@@ -131,13 +131,22 @@ pub fn reveal(path: &Path) {
 }
 
 /// Bundle ids of running apps. Called on the UI thread when a scan starts.
+/// Running apps, lower case: each app's bundle id, its name and its executable's name.
 pub fn running_apps() -> HashSet<String> {
     autoreleasepool(|_| {
-        let apps = NSWorkspace::sharedWorkspace().runningApplications();
-        apps.iter()
-            .filter_map(|app| app.bundleIdentifier())
-            .map(|id| id.to_string())
-            .collect()
+        let mut out = HashSet::new();
+        for app in NSWorkspace::sharedWorkspace().runningApplications().iter() {
+            if let Some(id) = app.bundleIdentifier() {
+                out.insert(id.to_string().to_lowercase());
+            }
+            if let Some(name) = app.localizedName() {
+                out.insert(name.to_string().to_lowercase());
+            }
+            if let Some(exe) = app.executableURL().and_then(|u| u.lastPathComponent()) {
+                out.insert(exe.to_string().to_lowercase());
+            }
+        }
+        out
     })
 }
 
@@ -229,14 +238,96 @@ pub fn open_privacy_settings() {
 }
 
 /// Moves one item to the Trash. Never falls back to deleting it (safety rule S5).
-pub fn move_to_trash(path: &Path) -> Result<(), String> {
+/// Returns where the item went in the Trash, so it can be put back.
+pub fn move_to_trash(path: &Path) -> Result<Option<PathBuf>, String> {
     let path = path.to_str().ok_or("the name is not valid UTF-8")?;
     autoreleasepool(|_| {
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        let mut moved: Option<Retained<NSURL>> = None;
         NSFileManager::defaultManager()
-            .trashItemAtURL_resultingItemURL_error(&url, None)
-            .map_err(|e| e.localizedDescription().to_string())
+            .trashItemAtURL_resultingItemURL_error(&url, Some(&mut moved))
+            .map_err(|e| e.localizedDescription().to_string())?;
+        Ok(moved
+            .and_then(|u| u.path())
+            .map(|p| PathBuf::from(p.to_string())))
     })
+}
+
+/// Puts items back from the Trash: `(original path, path in the Trash)`.
+/// Without Full Disk Access macOS refuses a plain rename out of the Trash, so Finder
+/// moves the item instead.
+pub fn restore_from_trash(
+    items: &[(PathBuf, Option<PathBuf>)],
+    _since: i64,
+) -> Vec<(PathBuf, Result<(), String>)> {
+    items
+        .iter()
+        .map(|(original, trashed)| {
+            let result = match trashed {
+                None => Err("its place in the Trash is unknown".to_owned()),
+                Some(_) if std::fs::symlink_metadata(original).is_ok() => {
+                    Err("something else now has its name".to_owned())
+                }
+                Some(trashed) => put_back(trashed, original),
+            };
+            (original.clone(), result)
+        })
+        .collect()
+}
+
+fn put_back(trashed: &Path, original: &Path) -> Result<(), String> {
+    match std::fs::rename(trashed, original) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() != io::ErrorKind::PermissionDenied => return Err(e.to_string()),
+        Err(_) => {}
+    }
+    let parent = original.parent().ok_or("no parent folder")?;
+    let quote = |p: &Path| {
+        p.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    };
+    let script = format!(
+        "tell application \"Finder\" to move (POSIX file \"{}\" as alias) to (POSIX file \"{}\" as alias)",
+        quote(trashed),
+        quote(parent)
+    );
+    let out = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
+    // Finder keeps the name the item had in the Trash; give it back its own name.
+    let landed = parent.join(trashed.file_name().ok_or("no name")?);
+    if landed != original {
+        std::fs::rename(&landed, original).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Shows a Quick Look preview. A newer preview replaces the previous one.
+pub fn preview(path: &Path) {
+    use std::sync::Mutex;
+    static CURRENT: Mutex<Option<std::process::Child>> = Mutex::new(None);
+    let mut current = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(mut old) = current.take() {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+    *current = Command::new("/usr/bin/qlmanage")
+        .arg("-p")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok();
+}
+
+/// Where settings live: `~/Library/Application Support/<bundle id>`.
+pub fn config_dir() -> Option<PathBuf> {
+    std::env::home_dir().map(|h| h.join("Library/Application Support").join(rules::APP_ID))
 }
 
 /// Empties the Trash through Finder. Used when the app cannot read `~/.Trash`.

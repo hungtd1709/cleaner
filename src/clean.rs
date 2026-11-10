@@ -1,6 +1,6 @@
 //! Cleaning: safety re-checks, then delete, move to the Trash, or empty the Trash.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::fmt;
 use crate::platform;
-use crate::rules::{self, Action, Category, Guard};
+use crate::rules::{self, Action, Guard};
 use crate::scan::{Ident, Item, Shape, Status, mtime_of};
 
 /// The report lists at most this many skipped paths.
@@ -19,6 +19,13 @@ pub struct Job {
     /// Index of the item in the app's list.
     pub index: usize,
     pub item: Item,
+}
+
+/// One file of a duplicate group in the app's list, selected or not.
+pub struct GroupFile {
+    pub group: u32,
+    pub path: PathBuf,
+    pub modified: i64,
 }
 
 #[derive(Default)]
@@ -46,6 +53,10 @@ pub struct Report {
     pub stopped: bool,
     /// Why nothing was cleaned at all.
     pub refused: Option<String>,
+    /// Items moved to the Trash: (item index, original path, path in the Trash).
+    pub moved: Vec<(usize, PathBuf, Option<PathBuf>)>,
+    /// When cleaning started, in seconds since 1970. Undo looks for items from then on.
+    pub started: i64,
 }
 
 pub struct Handle {
@@ -54,11 +65,12 @@ pub struct Handle {
     pub rx: mpsc::Receiver<Report>,
 }
 
-/// Cleans in the background. `group_sizes` maps each duplicate group to its number of files.
+/// Cleans in the background. `group_files` lists every file of every duplicate group.
 pub fn start(
     jobs: Vec<Job>,
-    group_sizes: HashMap<u32, usize>,
+    group_files: Vec<GroupFile>,
     low_power: bool,
+    never: Vec<PathBuf>,
     repaint: impl Fn() + Send + 'static,
 ) -> Handle {
     let progress = Arc::new(Progress::default());
@@ -68,7 +80,7 @@ pub fn start(
     std::thread::Builder::new()
         .name("clean".into())
         .spawn(move || {
-            let report = run(jobs, &group_sizes, low_power, &p, &c);
+            let report = run(jobs, &group_files, low_power, &never, &p, &c);
             let _ = tx.send(report);
             repaint();
         })
@@ -86,17 +98,23 @@ struct Outcome {
     trashed: u64,
     skipped: Vec<(PathBuf, String)>,
     complete: bool,
+    /// For a move to the Trash: the original path and where it went.
+    moved: Option<(PathBuf, Option<PathBuf>)>,
 }
 
 pub fn run(
     jobs: Vec<Job>,
-    group_sizes: &HashMap<u32, usize>,
+    group_files: &[GroupFile],
     low_power: bool,
+    never: &[PathBuf],
     progress: &Progress,
     cancel: &AtomicBool,
 ) -> Report {
     let _activity = platform::begin_activity("Cleaning files");
-    let mut report = Report::default();
+    let mut report = Report {
+        started: fmt::now(),
+        ..Report::default()
+    };
     if platform::is_elevated() {
         report.refused = Some(
             "Cleaner is running as an administrator, so it does not clean anything.".to_owned(),
@@ -108,7 +126,7 @@ pub fn run(
         return report;
     };
     let targets = rules::targets(&env);
-    let guard = Guard::new(&env, &targets);
+    let guard = Guard::new(&env, &targets, never);
     let roots: HashSet<PathBuf> = targets
         .iter()
         .flat_map(|t| t.roots.iter().cloned())
@@ -116,7 +134,7 @@ pub fn run(
     report.free_before = platform::system_disk().map(|d| d.free);
 
     let mut outcomes: Vec<(usize, Outcome)> = Vec::new();
-    let (jobs, followers) = normalize(jobs, group_sizes, &mut outcomes);
+    let (jobs, followers) = normalize(jobs, group_files, &mut outcomes);
     progress.total.store(jobs.len(), Relaxed);
     let (deletes, others): (Vec<&Job>, Vec<&Job>) =
         jobs.iter().partition(|j| j.item.action() == Action::Delete);
@@ -163,6 +181,9 @@ pub fn run(
     for (index, outcome) in outcomes {
         report.removed += outcome.removed;
         report.trashed += outcome.trashed;
+        if let Some((original, in_trash)) = outcome.moved {
+            report.moved.push((index, original, in_trash));
+        }
         if outcome.complete {
             report.finished.push(index);
         } else if outcome.removed + outcome.trashed > 0 {
@@ -181,47 +202,27 @@ pub fn run(
     report
 }
 
-/// Keeps one file of every duplicate group whose files are all selected (rule S10), and
-/// drops items inside another selected item. A dropped item becomes a "follower": it is
-/// done only if the item that covers it is done (see `resolve_followers`).
+/// Keeps one file of every duplicate group (rule S10), and drops items inside another
+/// selected item. A dropped item becomes a "follower": it is done only if the item that
+/// covers it is done (see `resolve_followers`).
 fn normalize(
     mut jobs: Vec<Job>,
-    group_sizes: &HashMap<u32, usize>,
+    group_files: &[GroupFile],
     outcomes: &mut Vec<(usize, Outcome)>,
 ) -> (Vec<Job>, Vec<(usize, PathBuf)>) {
-    let mut chosen: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (i, job) in jobs.iter().enumerate() {
-        if job.item.category == Category::Duplicates && job.item.dupe_group != 0 {
-            chosen.entry(job.item.dupe_group).or_default().push(i);
-        }
-    }
-    let mut keep = HashSet::new();
-    for (group, members) in chosen {
-        if group_sizes.get(&group).is_some_and(|&n| members.len() >= n) {
-            // Every copy is selected: keep the oldest one.
-            if let Some(&oldest) = members
-                .iter()
-                .min_by_key(|&&i| (jobs[i].item.modified, jobs[i].item.paths[0].clone()))
-            {
-                keep.insert(oldest);
-            }
-        }
-    }
+    let keep = keep_last_copies(&jobs, group_files);
     let mut index = 0;
     jobs.retain(|job| {
-        let kept = keep.contains(&index);
+        let why = keep.get(&index);
         index += 1;
-        if kept {
+        if let Some(&why) = why {
             let outcome = Outcome {
-                skipped: vec![(
-                    job.item.paths[0].clone(),
-                    "kept as the last copy".to_owned(),
-                )],
+                skipped: vec![(job.item.paths[0].clone(), why.to_owned())],
                 ..Outcome::default()
             };
             outcomes.push((job.index, outcome));
         }
-        !kept
+        why.is_none()
     });
 
     let entries: HashSet<PathBuf> = jobs
@@ -247,6 +248,63 @@ fn normalize(
         true
     });
     (jobs, followers)
+}
+
+/// Rule S10: one file of every duplicate group stays, whichever category selected the
+/// others. A file goes if a job removes its path or a folder that holds it. Returns the
+/// jobs (by position) that must not run, with the reason.
+fn keep_last_copies(jobs: &[Job], group_files: &[GroupFile]) -> HashMap<usize, &'static str> {
+    let mut by_path: HashMap<&Path, Vec<usize>> = HashMap::new();
+    for (i, job) in jobs.iter().enumerate() {
+        if job.item.shape == Shape::Entry {
+            by_path
+                .entry(job.item.paths[0].as_path())
+                .or_default()
+                .push(i);
+        }
+    }
+    let mut groups: BTreeMap<u32, Vec<&GroupFile>> = BTreeMap::new();
+    for f in group_files {
+        groups.entry(f.group).or_default().push(f);
+    }
+    let mut dropped: HashMap<usize, &'static str> = HashMap::new();
+    for files in groups.values() {
+        // The jobs that would remove each file. One file that no job removes is enough.
+        let removers: Vec<Vec<usize>> = files
+            .iter()
+            .map(|f| {
+                f.path
+                    .ancestors()
+                    .filter_map(|a| by_path.get(a))
+                    .flatten()
+                    .copied()
+                    .filter(|j| !dropped.contains_key(j))
+                    .collect()
+            })
+            .collect();
+        if removers.iter().any(Vec::is_empty) {
+            continue;
+        }
+        // Keep the oldest file, preferring one that no selected folder holds, so that
+        // the folder can still go.
+        let Some(keep) = (0..files.len()).min_by_key(|&k| {
+            let in_folder = removers[k]
+                .iter()
+                .any(|&j| jobs[j].item.paths[0] != files[k].path);
+            (in_folder, files[k].modified, &files[k].path)
+        }) else {
+            continue;
+        };
+        for &j in &removers[keep] {
+            let why = if jobs[j].item.paths[0] == files[keep].path {
+                "kept as the last copy"
+            } else {
+                "holds the last copy of a duplicate"
+            };
+            dropped.insert(j, why);
+        }
+    }
+    dropped
 }
 
 /// A follower is finished only if the item covering it was cleaned completely.
@@ -345,9 +403,9 @@ fn delete_item(
     let complete = d.skipped.is_empty() && !cancel.load(Relaxed);
     Outcome {
         removed: d.removed,
-        trashed: 0,
         skipped: d.skipped,
         complete,
+        ..Outcome::default()
     }
 }
 
@@ -360,17 +418,36 @@ fn trash_item(item: &Item, guard: &Guard) -> Outcome {
     if let Err(why) = guard.check(path, &item.root) {
         return fail(why.to_owned());
     }
+    // The Trash takes a folder as a whole, so a Never touch item inside would go too.
+    if guard.holds_hard(path) {
+        return fail("holds a Never touch item".to_owned());
+    }
     if !ident_ok(path, item.ident, true) {
         return fail("it changed since the scan".to_owned());
     }
     match platform::move_to_trash(path) {
-        Ok(()) => Outcome {
+        Ok(in_trash) => Outcome {
             trashed: item.size,
             complete: true,
+            moved: Some((path.clone(), in_trash)),
             ..Outcome::default()
         },
         Err(why) => fail(why),
     }
+}
+
+/// Puts back items that a clean moved to the Trash. Runs in the background.
+pub fn restore(
+    items: Vec<(PathBuf, Option<PathBuf>)>,
+    since: i64,
+    repaint: impl Fn() + Send + 'static,
+) -> mpsc::Receiver<Vec<(PathBuf, Result<(), String>)>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(platform::restore_from_trash(&items, since));
+        repaint();
+    });
+    rx
 }
 
 fn empty_trash(
@@ -452,7 +529,9 @@ impl Deleter<'_> {
         if platform::RENAME_BEFORE_DELETE && self.cutoff == 0 {
             let is_dir =
                 fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
-            let holds_root = self.exclude.iter().any(|r| r.starts_with(path));
+            // A rename would move what must stay: another target's root or a Never touch item.
+            let holds_root =
+                self.exclude.iter().any(|r| r.starts_with(path)) || self.guard.holds_hard(path);
             if is_dir && !holds_root {
                 let moved = renamed(path);
                 if fs::rename(path, &moved).is_err() {
@@ -625,7 +704,7 @@ fn reason(e: &io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Env, Filter, Mode, Target, tests::tempdir};
+    use crate::rules::{Category, Env, Filter, Mode, Target, tests::tempdir};
 
     fn setup(tag: &str) -> (PathBuf, Guard, HashSet<PathBuf>, PathBuf) {
         let dir = tempdir(tag);
@@ -648,8 +727,11 @@ mod tests {
             min_age_days: 0,
             app_id: None,
             selected: true,
+            keep: Vec::new(),
+            note: "",
+            watch_recent: false,
         };
-        let guard = Guard::new(&env, std::slice::from_ref(&target));
+        let guard = Guard::new(&env, std::slice::from_ref(&target), &[]);
         (dir, guard, HashSet::from([root.clone()]), root)
     }
 
@@ -822,7 +904,7 @@ mod tests {
                         item: j.item.clone(),
                     })
                     .collect(),
-                &HashMap::new(),
+                &[],
                 &mut outcomes,
             );
             assert_eq!(kept.iter().map(|j| j.index).collect::<Vec<_>>(), [0, 2]);
@@ -873,10 +955,127 @@ mod tests {
             Job { index, item }
         };
         let jobs = vec![job(0, "a", 20), job(1, "b", 10), job(2, "c", 30)];
+        let files: Vec<GroupFile> = jobs
+            .iter()
+            .map(|j| GroupFile {
+                group: 1,
+                path: j.item.paths[0].clone(),
+                modified: j.item.modified,
+            })
+            .collect();
         let mut outcomes = Vec::new();
-        let (kept, _) = normalize(jobs, &HashMap::from([(1, 3)]), &mut outcomes);
+        let (kept, _) = normalize(jobs, &files, &mut outcomes);
         let names: Vec<_> = kept.iter().map(|j| j.item.name.clone()).collect();
         assert_eq!(names, ["a", "c"], "the oldest copy (b) stays");
+    }
+
+    #[test]
+    fn keeps_a_copy_that_another_category_selected() {
+        let job = |index: usize, path: &str, category: Category| Job {
+            index,
+            item: Item::new(
+                category,
+                path,
+                vec![PathBuf::from(path)],
+                PathBuf::from("/h"),
+                Shape::Entry,
+            ),
+        };
+        let file = |path: &str, modified: i64| GroupFile {
+            group: 1,
+            path: PathBuf::from(path),
+            modified,
+        };
+        // Returns the jobs that run, and the skipped jobs with their reason.
+        let run = |jobs: Vec<Job>, files: &[GroupFile]| {
+            let mut outcomes = Vec::new();
+            let (left, _) = normalize(jobs, files, &mut outcomes);
+            let skipped: Vec<(usize, String)> = outcomes
+                .iter()
+                .map(|(i, o)| (*i, o.skipped[0].1.clone()))
+                .collect();
+            (left.iter().map(|j| j.index).collect::<Vec<_>>(), skipped)
+        };
+
+        // The oldest copy is selected as an installer, the other one as a duplicate.
+        let files = [
+            file("/h/Downloads/a.dmg", 10),
+            file("/h/Documents/a.dmg", 20),
+        ];
+        let jobs = vec![
+            job(0, "/h/Downloads/a.dmg", Category::Installers),
+            job(1, "/h/Documents/a.dmg", Category::Duplicates),
+        ];
+        assert_eq!(
+            run(jobs, &files),
+            (vec![1], vec![(0, "kept as the last copy".to_owned())])
+        );
+
+        // A selected Downloads folder holds the oldest copy: the other copy stays, so
+        // the folder can still go.
+        let files = [
+            file("/h/Downloads/old/a.bin", 10),
+            file("/h/Documents/a.bin", 20),
+        ];
+        let jobs = vec![
+            job(0, "/h/Downloads/old", Category::OldDownloads),
+            job(1, "/h/Documents/a.bin", Category::Duplicates),
+        ];
+        assert_eq!(
+            run(jobs, &files),
+            (vec![0], vec![(1, "kept as the last copy".to_owned())])
+        );
+
+        // The folder holds every copy, so the folder stays.
+        let files = [
+            file("/h/Downloads/old/a.bin", 10),
+            file("/h/Downloads/old/b.bin", 20),
+        ];
+        let jobs = vec![job(0, "/h/Downloads/old", Category::OldDownloads)];
+        assert_eq!(
+            run(jobs, &files),
+            (
+                vec![],
+                vec![(0, "holds the last copy of a duplicate".to_owned())]
+            )
+        );
+
+        // A copy that nothing selects stays anyway: every job runs.
+        let files = [
+            file("/h/Downloads/a.dmg", 10),
+            file("/h/Documents/a.dmg", 20),
+        ];
+        let jobs = vec![job(1, "/h/Documents/a.dmg", Category::Duplicates)];
+        assert_eq!(run(jobs, &files), (vec![1], vec![]));
+    }
+
+    #[test]
+    fn refuses_to_trash_a_folder_that_holds_a_never_touch_item() {
+        let dir = tempdir("clean-never");
+        let home = dir.join("home");
+        let downloads = home.join("Downloads");
+        let folder = downloads.join("old");
+        std::fs::create_dir_all(folder.join("keep")).unwrap();
+        let env = Env {
+            home: home.clone(),
+            temp: home.join("tmp"),
+            downloads: downloads.clone(),
+            local: home.join("Library"),
+            cloud: Vec::new(),
+        };
+        let guard = Guard::new(&env, &[], &[folder.join("keep")]);
+        let item = Item::new(
+            Category::OldDownloads,
+            "old",
+            vec![folder.clone()],
+            downloads,
+            Shape::Entry,
+        );
+        // The refusal comes before any move to the Trash.
+        let out = trash_item(&item, &guard);
+        assert!(!out.complete);
+        assert_eq!(out.skipped[0].1, "holds a Never touch item");
+        assert!(folder.join("keep").exists());
     }
 }
 
@@ -885,6 +1084,7 @@ mod tests {
 #[cfg(test)]
 mod real {
     use super::*;
+    use crate::rules::Category;
     use crate::scan::Ident;
 
     fn ident(path: &Path) -> Ident {
@@ -947,8 +1147,9 @@ mod real {
         ];
         let report = run(
             jobs,
-            &HashMap::new(),
+            &[],
             false,
+            &[],
             &Progress::default(),
             &AtomicBool::new(false),
         );
@@ -958,6 +1159,17 @@ mod real {
         assert!(!cache.exists(), "the test cache is gone");
         assert!(caches.exists(), "~/Library/Caches itself stays");
         assert!(!file.exists(), "the test file went to the Trash");
+        // Undo: put the test file back and check its content.
+        let moved: Vec<_> = report
+            .moved
+            .iter()
+            .map(|(_, o, t)| (o.clone(), t.clone()))
+            .collect();
+        let back = platform::restore_from_trash(&moved, report.started);
+        println!("restore: {back:?}");
+        assert!(back.iter().all(|(_, r)| r.is_ok()), "{back:?}");
+        assert_eq!(fs::read(&file).unwrap(), vec![2u8; 4096]);
+        fs::remove_file(&file).unwrap();
         assert_eq!(report.trashed, 4096);
     }
 }

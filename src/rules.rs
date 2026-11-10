@@ -11,28 +11,32 @@ pub enum Category {
     SystemJunk,
     OptionalCaches,
     Browsers,
+    AppData,
     DevCaches,
     XcodeArchives,
     BuildFolders,
     Trash,
     LargeFiles,
     OldDownloads,
+    Installers,
     Duplicates,
 }
 
-pub const CATEGORY_COUNT: usize = 10;
+pub const CATEGORY_COUNT: usize = 12;
 
 impl Category {
     pub const ALL: [Category; CATEGORY_COUNT] = [
         Category::SystemJunk,
         Category::OptionalCaches,
         Category::Browsers,
+        Category::AppData,
         Category::DevCaches,
         Category::XcodeArchives,
         Category::BuildFolders,
         Category::Trash,
         Category::LargeFiles,
         Category::OldDownloads,
+        Category::Installers,
         Category::Duplicates,
     ];
 
@@ -56,6 +60,7 @@ impl Category {
                 }
             }
             Category::Browsers => "Browser caches",
+            Category::AppData => "App data",
             Category::DevCaches => "Developer caches",
             Category::XcodeArchives => "Xcode Archives",
             Category::BuildFolders => "Build folders",
@@ -68,6 +73,7 @@ impl Category {
             }
             Category::LargeFiles => "Large files",
             Category::OldDownloads => "Old Downloads",
+            Category::Installers => "Installers",
             Category::Duplicates => "Duplicates",
         }
     }
@@ -88,6 +94,9 @@ impl Category {
             Category::Browsers => {
                 "Cached web pages and scripts. Browsers download them again. Quit the browser before cleaning."
             }
+            Category::AppData => {
+                "Caches inside app folders, old app versions and old sessions. Quit an app before cleaning its data."
+            }
             Category::DevCaches => {
                 "Package and build caches. Your tools download or rebuild them, which takes time."
             }
@@ -99,13 +108,16 @@ impl Category {
             }
             Category::Trash => "Files you already deleted. Emptying cannot be undone.",
             Category::LargeFiles => {
-                "Big files in your home folder. Selected files go to the Trash."
+                "Big files in your home folder, outside tool folders. Selected files go to the Trash."
             }
             Category::OldDownloads => {
                 "Downloads not added or changed for 90 days. Selected items go to the Trash."
             }
+            Category::Installers => {
+                "Installers in Downloads, such as .dmg, .pkg and app .zip files. Once the app is installed you can remove them. Selected files go to the Trash."
+            }
             Category::Duplicates => {
-                "Files with identical content. Keep one copy of each; the others go to the Trash."
+                "Your own files with identical content, checked byte by byte. Tool folders and code projects are not searched. Keep one copy of each; the others go to the Trash."
             }
         }
     }
@@ -115,6 +127,7 @@ impl Category {
             Category::XcodeArchives
             | Category::LargeFiles
             | Category::OldDownloads
+            | Category::Installers
             | Category::Duplicates => Action::Trash,
             Category::Trash => Action::EmptyTrash,
             _ => Action::Delete,
@@ -178,6 +191,12 @@ pub struct Target {
     pub app_id: Option<String>,
     /// Whether the items start selected.
     pub selected: bool,
+    /// Children of a `Children` root that are never listed, such as the newest version.
+    pub keep: Vec<PathBuf>,
+    /// A short warning shown with each item.
+    pub note: &'static str,
+    /// The item counts as in use if a file in it changed in the last few minutes.
+    pub watch_recent: bool,
 }
 
 /// Folders the rules are built from. All paths are absolute and fully resolved.
@@ -242,12 +261,12 @@ impl Builder {
         roots: Vec<PathBuf>,
         selected: bool,
         app: Option<&str>,
-    ) {
+    ) -> Option<&mut Target> {
         let mut roots: Vec<PathBuf> = roots.iter().filter_map(|r| resolve_dir(r)).collect();
         roots.sort();
         roots.dedup();
         if roots.is_empty() {
-            return;
+            return None;
         }
         self.targets.push(Target {
             category,
@@ -258,7 +277,12 @@ impl Builder {
             min_age_days: 0,
             app_id: app.map(str::to_owned),
             selected,
+            keep: Vec::new(),
+            note: "",
+            // A browser or app cache written to a moment ago belongs to an open app.
+            watch_recent: matches!(category, Category::Browsers | Category::AppData),
         });
+        self.targets.last_mut()
     }
 
     fn children(
@@ -282,8 +306,164 @@ impl Builder {
             min_age_days,
             app_id: None,
             selected,
+            keep: Vec::new(),
+            note: "",
+            watch_recent: false,
         });
     }
+
+    /// Old versions in `root`: every child except the newest and those in `keep`.
+    fn old_versions(
+        &mut self,
+        category: Category,
+        name: &str,
+        root: PathBuf,
+        keep: Vec<PathBuf>,
+        app: Option<&str>,
+    ) {
+        let Some(root) = resolve_dir(&root) else {
+            return;
+        };
+        let Ok(read) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let mut versions: Vec<(Vec<u64>, PathBuf)> = Vec::new();
+        let mut keep: Vec<PathBuf> = keep
+            .iter()
+            .map(|k| root.join(k.file_name().unwrap_or_default()))
+            .collect();
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match version_key(&name) {
+                Some(key) => versions.push((key, path)),
+                // Anything that is not a version, such as `.sdk-version`, stays.
+                None => keep.push(path),
+            }
+        }
+        versions.sort();
+        if let Some((_, newest)) = versions.last() {
+            keep.push(newest.clone());
+        }
+        if versions.len() <= 1 {
+            return;
+        }
+        self.targets.push(Target {
+            category,
+            name: name.to_owned(),
+            roots: vec![root],
+            mode: Mode::Children,
+            filter: Filter::Any,
+            min_age_days: 0,
+            app_id: app.map(str::to_owned),
+            selected: true,
+            keep,
+            note: "",
+            watch_recent: false,
+        });
+    }
+
+    /// One item per Electron app: the cache folders inside its data folder.
+    fn electron_apps(&mut self, base: &Path, exe_suffix: bool) {
+        let Ok(read) = std::fs::read_dir(base) else {
+            return;
+        };
+        let mut dirs: Vec<PathBuf> = read
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let Some(name) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if BROWSER_VENDORS
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(&name))
+                || name == APP_ID
+            {
+                continue;
+            }
+            if !ELECTRON_MARKERS.iter().any(|m| dir.join(m).is_dir()) {
+                continue;
+            }
+            let roots: Vec<PathBuf> = ELECTRON_CACHES.iter().map(|c| dir.join(c)).collect();
+            let app = if exe_suffix {
+                format!("{}.exe", name.to_lowercase())
+            } else {
+                name.clone()
+            };
+            self.whole(
+                Category::AppData,
+                &format!("{name} cache"),
+                roots,
+                true,
+                Some(&app),
+            );
+        }
+    }
+
+    /// Claude Code data shared by both systems: old versions and old sessions.
+    fn claude_code(&mut self, home: &Path) {
+        let link = home.join(".local/bin/claude");
+        let current = std::fs::read_link(&link)
+            .ok()
+            .or_else(|| std::fs::read_link(home.join(".local/bin/claude.exe")).ok());
+        self.old_versions(
+            Category::AppData,
+            "Old Claude Code version",
+            home.join(".local/share/claude/versions"),
+            current.into_iter().collect(),
+            None,
+        );
+        let days = claude_cleanup_days(home);
+        let roots = [
+            "projects",
+            "file-history",
+            "shell-snapshots",
+            "todos",
+            "debug",
+        ]
+        .iter()
+        .map(|d| home.join(".claude").join(d))
+        .collect();
+        if let Some(t) = self.whole(
+            Category::AppData,
+            &format!("Claude Code sessions older than {days} days"),
+            roots,
+            false,
+            None,
+        ) {
+            t.min_age_days = days;
+            t.note = "These sessions can no longer be resumed.";
+        }
+    }
+}
+
+/// Sort key of a version name such as `2.1.296`. `None` if it is not a version.
+fn version_key(name: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = name
+        .split(['.', '-'])
+        .map_while(|p| p.parse().ok())
+        .collect();
+    (parts.len() >= 2 && name.as_bytes()[0].is_ascii_digit()).then_some(parts)
+}
+
+/// Claude Code keeps session transcripts for `cleanupPeriodDays` days (30 by default).
+fn claude_cleanup_days(home: &Path) -> u32 {
+    let text = std::fs::read_to_string(home.join(".claude/settings.json")).unwrap_or_default();
+    text.split_once("\"cleanupPeriodDays\"")
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix(':'))
+        .map(|rest| {
+            rest.trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .filter(|&d: &u32| d > 0)
+        .unwrap_or(30)
 }
 
 /// The cleaning targets for this OS. Targets whose folders do not exist are left out.
@@ -371,6 +551,28 @@ fn os_targets(b: &mut Builder, env: &Env) {
         true,
         Some("com.apple.Safari"),
     );
+
+    // App data: Electron app caches, then Claude Desktop and Claude Code.
+    b.electron_apps(&support, false);
+    if let Some(t) = b.whole(
+        AppData,
+        "Claude VM image (Cowork)",
+        vec![support.join("Claude/vm_bundles")],
+        false,
+        Some("Claude"),
+    ) {
+        t.note = "Claude downloads it again (about 10 GB) when Cowork or code execution is next used. Cowork history stored in it is lost.";
+    }
+    for part in ["claude-code", "claude-code-vm"] {
+        b.old_versions(
+            AppData,
+            "Old Claude Desktop component",
+            support.join("Claude").join(part),
+            Vec::new(),
+            Some("Claude"),
+        );
+    }
+    b.claude_code(h);
 
     let xcode = Some("com.apple.dt.Xcode");
     b.whole(
@@ -470,6 +672,23 @@ fn os_targets(b: &mut Builder, env: &Env) {
         false,
         None,
     );
+    dev_caches_shared(b, h);
+    b.whole(
+        DevCaches,
+        "pnpm store",
+        vec![lib.join("pnpm/store")],
+        false,
+        None,
+    );
+    if let Some(t) = b.whole(
+        DevCaches,
+        "Dart and Flutter packages",
+        vec![h.join(".pub-cache")],
+        false,
+        None,
+    ) {
+        t.note = "Also removes globally activated Dart tools.";
+    }
     b.children(
         DevCaches,
         "Tool cache",
@@ -581,6 +800,33 @@ fn os_targets(b: &mut Builder, env: &Env) {
         Some("firefox.exe"),
     );
 
+    // App data: Electron app caches (Roaming and Local), then Claude Desktop and Claude Code.
+    let roaming = local
+        .parent()
+        .map(|p| p.join("Roaming"))
+        .unwrap_or_default();
+    b.electron_apps(&roaming, true);
+    b.electron_apps(local, true);
+    if let Some(t) = b.whole(
+        AppData,
+        "Claude VM image (Cowork)",
+        vec![roaming.join(r"Claude\vm_bundles")],
+        false,
+        Some("claude.exe"),
+    ) {
+        t.note = "Claude downloads it again (about 10 GB) when Cowork or code execution is next used. Cowork history stored in it is lost.";
+    }
+    for part in ["claude-code", "claude-code-vm"] {
+        b.old_versions(
+            AppData,
+            "Old Claude Desktop component",
+            roaming.join("Claude").join(part),
+            Vec::new(),
+            Some("claude.exe"),
+        );
+    }
+    b.claude_code(h);
+
     b.whole(
         DevCaches,
         "npm cache",
@@ -647,6 +893,20 @@ fn os_targets(b: &mut Builder, env: &Env) {
         false,
         None,
     );
+    dev_caches_shared(b, h);
+    for (name, rel) in [
+        ("pnpm store", r"pnpm\store"),
+        ("Dart and Flutter packages", r"Pub\Cache"),
+        ("Composer cache", "Composer"),
+        ("Playwright browsers", "ms-playwright"),
+        ("Electron downloads", r"electron\Cache"),
+        ("electron-builder cache", r"electron-builder\Cache"),
+        ("uv cache", r"uv\cache"),
+        ("Poetry cache", r"pypoetry\Cache"),
+        ("Deno cache", "deno"),
+    ] {
+        b.whole(DevCaches, name, vec![local.join(rel)], false, None);
+    }
     b.children(
         DevCaches,
         "Tool cache",
@@ -666,7 +926,69 @@ fn os_targets(b: &mut Builder, env: &Env) {
         min_age_days: 0,
         app_id: None,
         selected: false,
+        keep: Vec::new(),
+        note: "",
+        watch_recent: false,
     });
+}
+
+/// Developer caches at the same place under the home folder on macOS and Windows.
+#[cfg(any(target_os = "macos", windows))]
+fn dev_caches_shared(b: &mut Builder, h: &Path) {
+    use Category::DevCaches;
+    if let Some(t) = b.whole(
+        DevCaches,
+        "NuGet packages",
+        vec![h.join(".nuget").join("packages")],
+        false,
+        None,
+    ) {
+        t.note = "Restored on the next build; offline builds fail until then.";
+    }
+    b.whole(
+        DevCaches,
+        "Bun cache",
+        vec![h.join(".bun").join("install").join("cache")],
+        false,
+        None,
+    );
+    b.whole(
+        DevCaches,
+        "Yarn Berry cache",
+        vec![h.join(".yarn").join("berry").join("cache")],
+        false,
+        None,
+    );
+    if let Some(t) = b.whole(
+        DevCaches,
+        "Maven repository",
+        vec![h.join(".m2").join("repository")],
+        false,
+        None,
+    ) {
+        t.note = "May hold artifacts you built yourself with `mvn install`.";
+    }
+    b.whole(
+        DevCaches,
+        "Composer cache",
+        vec![h.join(".composer").join("cache")],
+        false,
+        None,
+    );
+    b.whole(
+        DevCaches,
+        "Cargo git checkouts",
+        vec![h.join(".cargo").join("git").join("checkouts")],
+        false,
+        None,
+    );
+    b.whole(
+        DevCaches,
+        "Android build cache",
+        vec![h.join(".android").join("build-cache")],
+        false,
+        None,
+    );
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -756,6 +1078,81 @@ pub const WALK_SKIP: &[&str] = &[
     ".gnupg",
 ];
 
+/// Folders of dependencies and environments. Their files are not the user's own files.
+pub const ENV_DIRS: &[&str] = &[
+    "site-packages",
+    "vendor",
+    "Pods",
+    "bower_components",
+    "Carthage",
+    "jspm_packages",
+];
+
+/// Tool installs directly inside the home folder. Their files are not the user's own files.
+pub const TOOL_ROOTS: &[&str] = &[
+    "go",
+    "miniconda3",
+    "anaconda3",
+    "miniforge3",
+    "mambaforge",
+    "flutter",
+    "fvm",
+];
+
+/// Folders inside an Electron app's data folder that are caches.
+pub const ELECTRON_CACHES: &[&str] = &[
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GraphiteDawnCache",
+    "ShaderCache",
+    "GrShaderCache",
+    "Shared Dictionary",
+    "CachedData",
+    "CachedExtensionVSIXs",
+];
+
+/// A data folder with one of these is a Chromium-based (Electron) app.
+pub const ELECTRON_MARKERS: &[&str] = &["Code Cache", "GPUCache"];
+
+/// Browser data folders. Browsers have their own category.
+pub const BROWSER_VENDORS: &[&str] = &[
+    "Google",
+    "Microsoft Edge",
+    "Microsoft",
+    "BraveSoftware",
+    "Mozilla",
+    "Firefox",
+    "Arc",
+    "Vivaldi",
+    "Chromium",
+    "com.operasoftware.Opera",
+    "Opera Software",
+    "Packages",
+];
+
+/// Installer file types counted in Downloads, on any system.
+pub const INSTALLER_EXTS: &[&str] = &[
+    "dmg",
+    "pkg",
+    "mpkg",
+    "msi",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "appinstaller",
+];
+
+/// An `.exe` in Downloads whose name says it installs something.
+pub fn is_setup_exe(name: &OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name.ends_with(".exe") && (name.contains("setup") || name.contains("install"))
+}
+
 pub fn ext_in(name: &OsStr, list: &[&str]) -> bool {
     Path::new(name)
         .extension()
@@ -779,7 +1176,8 @@ pub struct Guard {
 }
 
 impl Guard {
-    pub fn new(env: &Env, targets: &[Target]) -> Guard {
+    /// `never` is the user's Never touch list: nothing inside it is listed or removed.
+    pub fn new(env: &Env, targets: &[Target], never: &[PathBuf]) -> Guard {
         let h = &env.home;
         let mut g = Guard::default();
         let mut anchors: Vec<PathBuf> = vec![
@@ -897,6 +1295,7 @@ impl Guard {
                 h.join(r".gradle\gradle.properties"),
             ];
         }
+        g.hard.extend(never.iter().cloned());
         anchors.sort();
         anchors.dedup();
         g.anchors = anchors;
@@ -943,6 +1342,12 @@ impl Guard {
     /// Paths inside a tree that is being deleted that must be left alone.
     pub fn hard_denied(&self, path: &Path) -> bool {
         self.hard.iter().any(|d| path.starts_with(d)) || is_ntuser(path)
+    }
+
+    /// True if a protected path, such as a Never touch item, is `path` or lies inside it.
+    /// Moving or renaming `path` would move that item too.
+    pub fn holds_hard(&self, path: &Path) -> bool {
+        self.hard.iter().any(|d| d.starts_with(path))
     }
 }
 
@@ -1007,8 +1412,16 @@ pub(crate) mod tests {
             min_age_days: 0,
             app_id: None,
             selected: true,
+            keep: Vec::new(),
+            note: "",
+            watch_recent: false,
         }];
-        let g = Guard::new(&env, &targets);
+        let never = vec![env.home.join("Keep")];
+        let g = Guard::new(&env, &targets, &never);
+        assert!(
+            g.check(&env.home.join("Keep/a.bin"), &env.home).is_err(),
+            "never touch"
+        );
         assert!(g.check(&caches.join("com.example"), &caches).is_ok());
         assert!(
             g.check(&caches, &caches).is_err(),
@@ -1034,6 +1447,72 @@ pub(crate) mod tests {
             "git"
         );
         assert!(g.check(&env.home.join("p/node_modules"), &env.home).is_ok());
+        assert!(g.holds_hard(&env.home.join("Keep")), "the item itself");
+        assert!(g.holds_hard(&env.home), "a folder that holds it");
+        assert!(!g.holds_hard(&env.home.join("Other")));
+        assert!(!g.holds_hard(&env.home.join("Keep/a.bin")), "inside it");
+    }
+
+    #[test]
+    fn keeps_the_newest_and_linked_versions() {
+        let dir = tempdir("versions");
+        for v in ["2.1.9", "2.1.10", "2.0.5", ".sdk-version"] {
+            std::fs::write(dir.join(v), b"x").unwrap();
+        }
+        let mut b = Builder {
+            targets: Vec::new(),
+        };
+        b.old_versions(
+            Category::AppData,
+            "Old",
+            dir.clone(),
+            vec![dir.join("2.1.9")],
+            None,
+        );
+        let t = &b.targets[0];
+        let mut keep: Vec<_> = t
+            .keep
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        keep.sort();
+        assert_eq!(keep, [".sdk-version", "2.1.10", "2.1.9"]);
+        assert_eq!(version_key("2.1.10"), Some(vec![2, 1, 10]));
+        assert_eq!(version_key("latest"), None);
+    }
+
+    #[test]
+    fn reads_claude_cleanup_days() {
+        let dir = tempdir("claude-settings");
+        assert_eq!(claude_cleanup_days(&dir), 30);
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            br#"{ "cleanupPeriodDays" : 14 }"#,
+        )
+        .unwrap();
+        assert_eq!(claude_cleanup_days(&dir), 14);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn notes_stay_with_their_own_target() {
+        let dir = tempdir("notes");
+        let mut env = env_in(&dir);
+        env.local = std::fs::canonicalize(env.home.join("Library")).unwrap();
+        std::fs::create_dir_all(env.home.join(".nuget/packages")).unwrap();
+        // No ~/.m2 here: the Maven note must not land on the NuGet item.
+        let all = targets(&env);
+        let nuget = all
+            .iter()
+            .find(|t| t.name == "NuGet packages")
+            .expect("NuGet target");
+        assert!(
+            nuget.note.starts_with("Restored on the next build"),
+            "{}",
+            nuget.note
+        );
+        assert!(!all.iter().any(|t| t.note.contains("mvn install")));
     }
 
     #[test]

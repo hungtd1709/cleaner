@@ -63,7 +63,9 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
             | libc::ATTR_CMN_ADDEDTIME,
         volattr: 0,
         dirattr: libc::ATTR_DIR_MOUNTSTATUS,
-        fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_TOTALSIZE | libc::ATTR_FILE_ALLOCSIZE,
+        fileattr: libc::ATTR_FILE_LINKCOUNT
+            | libc::ATTR_FILE_ALLOCSIZE
+            | libc::ATTR_FILE_DATALENGTH,
         forkattr: 0,
     };
     BUF.with_borrow_mut(|buf| {
@@ -187,12 +189,14 @@ fn parse(rec: &[u8]) -> Option<Entry> {
     } else {
         1
     };
-    let len = if read(libc::ATTR_FILE_TOTALSIZE, file) {
+    // Bit order: allocated size (0x4) comes before the data-fork length (0x200).
+    // The data fork is what reads see; `TOTALSIZE` would add resource forks.
+    let alloc = if read(libc::ATTR_FILE_ALLOCSIZE, file) {
         r.u64()?
     } else {
         0
     };
-    let alloc = if read(libc::ATTR_FILE_ALLOCSIZE, file) {
+    let len = if read(libc::ATTR_FILE_DATALENGTH, file) {
         r.u64()?
     } else {
         0

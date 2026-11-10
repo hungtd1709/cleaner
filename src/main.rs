@@ -7,6 +7,8 @@ mod fmt;
 mod platform;
 mod rules;
 mod scan;
+mod settings;
+mod space;
 mod theme;
 
 use eframe::egui;
@@ -21,9 +23,15 @@ fn main() {
         .with_app_id(rules::APP_ID)
         .with_inner_size([1040.0, 680.0])
         .with_min_inner_size([800.0, 500.0]);
-    // Inside Cleaner.app the Dock uses the sharper icon from the bundle.
-    if let Some(icon) = icon.clone().filter(|_| !platform::running_in_bundle()) {
-        viewport = viewport.with_icon(icon);
+    // Inside Cleaner.app the Dock uses the sharper icon from the bundle. An empty icon
+    // stops eframe from replacing it with its own default icon.
+    let window_icon = if platform::running_in_bundle() {
+        Some(egui::IconData::default())
+    } else {
+        icon.clone()
+    };
+    if let Some(i) = window_icon {
+        viewport = viewport.with_icon(i);
     }
     let options = eframe::NativeOptions {
         viewport,
