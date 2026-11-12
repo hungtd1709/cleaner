@@ -6,12 +6,57 @@
 //! never=/Users/me/Projects/keep
 //! ```
 //!
-//! Unknown lines are ignored, so older and newer versions can share the file.
+//! Unknown lines are ignored, so older and newer versions can share the file. A Never
+//! touch path with a line break is written as `never_escaped=`, with `\\`, `\n` and `\r`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::fmt;
 use crate::platform;
+
+/// The newest settings waiting to be written: the folder and the file's text.
+static PENDING: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+/// True while a writer thread runs.
+static WRITING: AtomicBool = AtomicBool::new(false);
+
+fn pending() -> MutexGuard<'static, Option<(PathBuf, String)>> {
+    PENDING.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Writes pending settings until none are left. Runs on its own thread.
+fn write_pending() {
+    loop {
+        let next = pending().take();
+        if let Some((dir, text)) = next {
+            let _ = std::fs::create_dir_all(&dir);
+            // A new file, then a rename: quitting midway leaves the old file whole.
+            let tmp = dir.join("settings.txt.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join("settings.txt"));
+            }
+            continue;
+        }
+        WRITING.store(false, SeqCst);
+        // A save may have come in after `take` found nothing. Write it here, unless that
+        // save started a writer of its own.
+        if pending().is_none() || WRITING.swap(true, SeqCst) {
+            return;
+        }
+    }
+}
+
+/// Waits up to two seconds for a running save, so the last change survives quitting.
+pub fn flush() {
+    for _ in 0..200 {
+        if !WRITING.load(SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortKey {
@@ -80,11 +125,20 @@ impl Settings {
             .map_or_else(Settings::default, |text| Settings::parse(&text))
     }
 
-    /// Saves quietly: settings are a convenience, so a failure must not stop the app.
+    /// Saves on a short-lived thread, so a slow disk, such as a settings folder on a network
+    /// share, never freezes the window. Only the newest settings are written, and the file
+    /// is replaced in one step, so it is never half written. Quiet: settings are a
+    /// convenience, so a failure must not stop the app.
     pub fn save(&self) {
-        if let Some(dir) = platform::config_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join("settings.txt"), self.text());
+        if cfg!(test) {
+            return; // Tests must not touch the user's settings.
+        }
+        let Some(dir) = platform::config_dir() else {
+            return;
+        };
+        *pending() = Some((dir, self.text()));
+        if !WRITING.swap(true, SeqCst) {
+            std::thread::spawn(write_pending);
         }
     }
 
@@ -94,7 +148,8 @@ impl Settings {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            match key.trim() {
+            let key = key.trim();
+            match key {
                 "large_limit" => {
                     if let Ok(v) = value.trim().parse() {
                         s.large_limit = v;
@@ -105,8 +160,12 @@ impl Settings {
                         s.sort = sort;
                     }
                 }
-                "never" => {
-                    let path = PathBuf::from(value);
+                "never" | "never_escaped" => {
+                    let path = PathBuf::from(if key == "never" {
+                        value.to_owned()
+                    } else {
+                        unescape(value)
+                    });
                     if path.is_absolute() && !s.never.contains(&path) {
                         s.never.push(path);
                     }
@@ -124,8 +183,16 @@ impl Settings {
             self.sort.text()
         );
         for p in &self.never {
-            out.push_str("never=");
-            out.push_str(&p.to_string_lossy());
+            let path = p.to_string_lossy();
+            // One line per path. Older versions ignore `never_escaped`, as they ignore
+            // any unknown key, instead of reading a broken path from a second line.
+            if path.contains(['\n', '\r']) {
+                out.push_str("never_escaped=");
+                out.push_str(&escape(&path));
+            } else {
+                out.push_str("never=");
+                out.push_str(&path);
+            }
             out.push('\n');
         }
         out
@@ -142,9 +209,67 @@ impl Settings {
     }
 }
 
+/// Writes `\` as `\\`, a line feed as `\n` and a carriage return as `\r`.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Reads what `escape` wrote.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_writer_saves_the_newest_settings_and_stops() {
+        let dir = crate::rules::tests::tempdir("settings-writer");
+        *pending() = Some((dir.clone(), "large_limit=7\n".to_owned()));
+        WRITING.store(true, SeqCst);
+        write_pending();
+        assert!(!WRITING.load(SeqCst), "the writer ended");
+        assert!(pending().is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.txt")).unwrap(),
+            "large_limit=7\n"
+        );
+        assert!(!dir.join("settings.txt.tmp").exists());
+        flush();
+    }
+
+    #[test]
+    fn keeps_a_path_with_a_line_break_on_one_line() {
+        let mut s = Settings::default();
+        assert!(s.add_never(Path::new("/Users/me/odd\nname\\x\r")));
+        let text = s.text();
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert_eq!(Settings::parse(&text), s);
+    }
 
     #[test]
     fn round_trips() {

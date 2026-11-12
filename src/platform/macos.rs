@@ -15,7 +15,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSFileManager, NSNumber, NSObjectProtocol,
-    NSOperatingSystemVersion, NSProcessInfo, NSString, NSURL,
+    NSOperatingSystemVersion, NSProcessInfo, NSString, NSURL, NSURLIsPackageKey,
     NSURLVolumeAvailableCapacityForImportantUsageKey, NSURLVolumeLocalizedNameKey,
     NSURLVolumeTotalCapacityKey,
 };
@@ -76,9 +76,12 @@ pub fn env() -> Option<Env> {
         .and_then(|t| rules::resolve_dir(&t))
         .unwrap_or_default();
     let local = home.join("Library");
+    // File Provider apps sync inside `~/Library`; older sync apps keep a folder in home.
+    let mut cloud = vec![local.join("CloudStorage"), local.join("Mobile Documents")];
+    cloud.extend(rules::home_sync_folders(&home));
     Some(Env {
         downloads: home.join("Downloads"),
-        cloud: vec![local.join("CloudStorage"), local.join("Mobile Documents")],
+        cloud,
         temp,
         local,
         home,
@@ -426,6 +429,70 @@ pub fn clone_id(path: &Path) -> Option<u64> {
     (id != 0).then_some(id)
 }
 
+/// When the item arrived in its folder ("date added"), in seconds since 1970. The scan's
+/// age limits count it, so the deleter must count it too.
+pub fn added_time(path: &Path) -> Option<i64> {
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_ADDEDTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buf = [0u8; 64];
+    // SAFETY: `list` and `buf` are valid for the sizes passed.
+    let r = unsafe {
+        libc::getattrlist(
+            c.as_ptr(),
+            (&raw mut list).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::FSOPT_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    // Layout: u32 length, attribute_set_t (5 × u32), then a timespec.
+    let returned = u32::from_ne_bytes(buf[4..8].try_into().ok()?);
+    if returned & libc::ATTR_CMN_ADDEDTIME == 0 {
+        return None;
+    }
+    Some(i64::from_ne_bytes(buf[24..32].try_into().ok()?))
+}
+
+/// The listings already carry each file's inode, so there is nothing more to read.
+pub fn file_index(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// The bulk listing and `lstat` report the same change time, so the deleter needs no
+/// second source (the `bulk_listing_matches_lstat` test checks this).
+pub fn listed_mtime(_path: &Path) -> Option<i64> {
+    None
+}
+
+/// True if Finder shows the folder as one file: its extension names a package type, or
+/// its bundle bit is set. The scan asks only about names the fixed list does not cover.
+pub fn is_package(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true);
+        // SAFETY: a constant NSString key exported by Foundation.
+        let key = unsafe { NSURLIsPackageKey };
+        url.resourceValuesForKeys_error(&NSArray::from_slice(&[key]))
+            .ok()
+            .and_then(|values| values.objectForKey(key))
+            .and_then(|v| v.downcast::<NSNumber>().ok())
+            .is_some_and(|n| n.boolValue())
+    })
+}
+
 /// Opens a file for hashing without filling the file cache with its content.
 pub fn open_for_hash(path: &Path) -> io::Result<File> {
     let file = File::open(path)?;
@@ -474,5 +541,25 @@ mod tests {
     fn user_temp_dir_exists() {
         let t = super::user_temp_dir().expect("temp dir");
         assert!(t.is_dir(), "{t:?}");
+    }
+
+    #[test]
+    fn asks_the_system_about_packages() {
+        let dir = crate::rules::tests::tempdir("package");
+        for name in ["Script.scptd", "Notes.rtfd", "Plain.data"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        assert!(super::is_package(&dir.join("Script.scptd")));
+        assert!(super::is_package(&dir.join("Notes.rtfd")));
+        assert!(!super::is_package(&dir.join("Plain.data")));
+    }
+
+    #[test]
+    fn reads_date_added() {
+        let dir = crate::rules::tests::tempdir("added");
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let added = super::added_time(&file).expect("date added");
+        assert!((added - crate::fmt::now()).abs() < 60, "{added}");
     }
 }

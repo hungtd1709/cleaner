@@ -53,12 +53,14 @@ fn name_of(path: &Path) -> String {
 }
 
 /// Builds the levels the scan already measured: home, and each folder in home.
-/// `skipped` is the folder the home pass leaves out (`Library` or `AppData`).
+/// `skipped` is the folder the home pass leaves out (`Library` or `AppData`). Folders of
+/// `cloud` that sit in home are listed but never measured, because no walk enters them.
 pub fn from_scan(
     home: &Path,
     map: &[MapEntry],
     home_files: u64,
     skipped: &[PathBuf],
+    cloud: &[PathBuf],
 ) -> HashMap<PathBuf, Level> {
     let mut levels = HashMap::new();
     let mut top = Level {
@@ -75,6 +77,11 @@ pub fn from_scan(
             protected: false,
             measured: true,
         });
+        // A cleaning root that the home pass skipped has only its total. With no level
+        // here, opening it measures its folders.
+        if !entry.walked {
+            continue;
+        }
         let mut level = Level {
             path: entry.path.clone(),
             nodes: Vec::new(),
@@ -103,6 +110,18 @@ pub fn from_scan(
                 size: 0,
                 files: 0,
                 protected: false,
+                measured: false,
+            });
+        }
+    }
+    for path in cloud.iter().filter(|p| p.parent() == Some(home)) {
+        if !top.nodes.iter().any(|n| &n.path == path) {
+            top.nodes.push(Node {
+                path: path.clone(),
+                name: name_of(path),
+                size: 0,
+                files: 0,
+                protected: true,
                 measured: false,
             });
         }
@@ -289,7 +308,12 @@ fn measure_now(
         path: dir.to_path_buf(),
         ..Level::default()
     };
+    let never = crate::rules::canonical_paths(never);
     let skip = |p: &Path| never.iter().any(|n| p.starts_with(n));
+    // A folder that joined the Never touch list after the scan is not walked (rule S12).
+    if skip(dir) {
+        return level;
+    }
     let Ok(entries) = walk::list(dir) else {
         return level;
     };
@@ -311,7 +335,7 @@ fn measure_now(
                     measured: !protected,
                 });
             }
-            walk::Kind::File if !e.cloud => level.loose += e.alloc,
+            walk::Kind::File if !e.cloud && !skip(&path) => level.loose += e.alloc,
             _ => {}
         }
     }
@@ -387,5 +411,53 @@ mod tests {
             Some("Rust")
         );
         assert!(protected(&dir, &dir.join("Library/Containers")));
+    }
+
+    #[test]
+    fn never_walks_a_never_touch_folder() {
+        let dir = crate::rules::tests::tempdir("space-never");
+        std::fs::create_dir_all(dir.join("Taxes/2024")).unwrap();
+        std::fs::write(dir.join("Taxes/2024/return.pdf"), vec![1u8; 5_000]).unwrap();
+        std::fs::write(dir.join("Taxes/notes.txt"), vec![1u8; 5_000]).unwrap();
+        // Added to Never touch after the scan listed it; the user then opens it.
+        let level = measure_now(
+            &dir.join("Taxes"),
+            &dir,
+            &[dir.join("Taxes")],
+            false,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        );
+        assert!(level.nodes.is_empty() && level.loose == 0, "{level:?}");
+    }
+
+    #[test]
+    fn opens_skipped_folders_by_measuring_them() {
+        let home = Path::new("/h");
+        let entry = |name: &str, walked: bool| MapEntry {
+            path: home.join(name),
+            size: 100,
+            files: 1,
+            children: Vec::new(),
+            walked,
+        };
+        let map = [entry("Documents", true), entry(".cache", false)];
+        let levels = from_scan(home, &map, 0, &[], &[]);
+        assert!(levels.contains_key(&home.join("Documents")));
+        assert!(
+            !levels.contains_key(&home.join(".cache")),
+            "opening it measures it"
+        );
+        assert_eq!(levels[home].nodes.len(), 2);
+    }
+
+    #[test]
+    fn lists_sync_folders_without_measuring_them() {
+        let home = Path::new("/h");
+        let cloud = [home.join("Dropbox"), home.join("Library/CloudStorage")];
+        let levels = from_scan(home, &[], 0, &[], &cloud);
+        let nodes = &levels[home].nodes;
+        assert_eq!(nodes.len(), 1, "only sync folders directly in home");
+        assert!(nodes[0].protected && !nodes[0].measured && nodes[0].name == "Dropbox");
     }
 }

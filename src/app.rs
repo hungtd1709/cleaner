@@ -72,10 +72,27 @@ enum Row {
 #[derive(Default, Clone)]
 struct Summary {
     total: u64,
-    /// Items that "Select all" may select: not running, not blocked.
+    /// Items that "Select all" may select (not running, not blocked) in the whole
+    /// category. The sidebar checkbox counts these.
     bulk: u64,
     bulk_selected: u64,
+    /// The same, among the rows that match the search box. The list's buttons count these.
+    shown: u64,
+    shown_selected: u64,
     text: String,
+}
+
+impl Summary {
+    /// What a click on the category's sidebar checkbox does: select (true) or clear.
+    /// Rule S10 keeps one copy of each duplicate group, so Duplicates is never all
+    /// selected: a click there clears any selection, or selects all but the oldest.
+    fn click_selects(&self, cat: Category) -> bool {
+        if cat == Category::Duplicates {
+            self.bulk_selected == 0
+        } else {
+            !(self.bulk > 0 && self.bulk_selected == self.bulk)
+        }
+    }
 }
 
 struct Plan {
@@ -123,7 +140,10 @@ struct SpaceState {
 
 pub struct CleanerApp {
     icon: Option<TextureHandle>,
+    /// Home and Downloads as the last scan found them. Finding them can be slow, so the
+    /// scan thread does it and the window never waits for it.
     home: Option<PathBuf>,
+    downloads: Option<PathBuf>,
     disk: Option<(Disk, String)>,
     disk_rx: Option<mpsc::Receiver<Option<Disk>>>,
     phase: Phase,
@@ -131,6 +151,10 @@ pub struct CleanerApp {
     scanned: bool,
     items: Vec<Item>,
     candidates: Vec<dupes::Cand>,
+    /// Every file of every duplicate group, as the search found it, until the next search.
+    /// Rows leave the list, and files leave the disk or come back from the Trash, but
+    /// cleaning checks each file before rule S10 counts it.
+    dupe_files: Vec<clean::GroupFile>,
     finder: Option<dupes::Handle>,
     dupes_done: bool,
     view: View,
@@ -154,6 +178,9 @@ pub struct CleanerApp {
     never_input: String,
     /// Why the path typed in Settings was not added.
     never_error: Option<&'static str>,
+    /// The path typed in Settings, being resolved on a short-lived thread: a path on a
+    /// network share can take long. `None` inside means it does not exist.
+    never_check: Option<mpsc::Receiver<Option<PathBuf>>>,
     query: String,
     /// The clicked row; Space previews it.
     current: Option<usize>,
@@ -174,39 +201,7 @@ impl CleanerApp {
         });
         let mut app = CleanerApp {
             icon,
-            home: platform::env().map(|e| e.home),
-            disk: None,
-            disk_rx: None,
-            phase: Phase::Idle,
-            live: None,
-            scanned: false,
-            items: Vec::new(),
-            candidates: Vec::new(),
-            finder: None,
-            dupes_done: false,
-            view: View::Category(Category::SystemJunk),
-            rows: Vec::new(),
-            group_labels: Vec::new(),
-            oldest: HashSet::new(),
-            summary: Default::default(),
-            chosen_count: 0,
-            chosen_text: String::new(),
-            clean_label: "Clean".to_owned(),
-            fda: None,
-            elevated: platform::is_elevated(),
-            low_power: false,
-            notes: Vec::new(),
-            plan: None,
-            report: None,
-            undo: None,
-            settings: Settings::load(),
-            settings_open: false,
-            never_input: String::new(),
-            never_error: None,
-            query: String::new(),
-            current: None,
-            space: SpaceState::default(),
-            dirty: true,
+            ..CleanerApp::blank(Settings::load())
         };
         app.probe_disk(&cc.egui_ctx);
         #[cfg(feature = "autoscan")]
@@ -224,6 +219,50 @@ impl CleanerApp {
             app.start_scan(&cc.egui_ctx);
         }
         app
+    }
+
+    /// The app before its first scan, with no window: `new` adds the window's parts, and
+    /// tests use it as it is.
+    fn blank(settings: Settings) -> Self {
+        CleanerApp {
+            icon: None,
+            home: None,
+            downloads: None,
+            disk: None,
+            disk_rx: None,
+            phase: Phase::Idle,
+            live: None,
+            scanned: false,
+            items: Vec::new(),
+            candidates: Vec::new(),
+            dupe_files: Vec::new(),
+            finder: None,
+            dupes_done: false,
+            view: View::Category(Category::SystemJunk),
+            rows: Vec::new(),
+            group_labels: Vec::new(),
+            oldest: HashSet::new(),
+            summary: Default::default(),
+            chosen_count: 0,
+            chosen_text: String::new(),
+            clean_label: "Clean".to_owned(),
+            fda: None,
+            elevated: platform::is_elevated(),
+            low_power: false,
+            notes: Vec::new(),
+            plan: None,
+            report: None,
+            undo: None,
+            settings,
+            settings_open: false,
+            never_input: String::new(),
+            never_error: None,
+            never_check: None,
+            query: String::new(),
+            current: None,
+            space: SpaceState::default(),
+            dirty: true,
+        }
     }
 
     fn cat(&self) -> Option<Category> {
@@ -249,10 +288,13 @@ impl CleanerApp {
             || self.finder.is_some()
             || self.space.measuring.is_some()
             || self.undo.as_ref().is_some_and(|u| u.running.is_some())
+            || self.never_check.is_some()
     }
 
+    /// No background work that changes the list is running or about to: the list's
+    /// rows keep their positions, which a running clean reports by.
     fn idle(&self) -> bool {
-        matches!(self.phase, Phase::Idle) && self.finder.is_none()
+        matches!(self.phase, Phase::Idle) && self.finder.is_none() && self.never_check.is_none()
     }
 
     // ---- background results -------------------------------------------------------
@@ -315,6 +357,25 @@ impl CleanerApp {
             self.apply_restore(results);
         }
 
+        let checked = self.never_check.as_ref().map(|rx| rx.try_recv());
+        match checked {
+            Some(Ok(path)) => {
+                self.never_check = None;
+                match path {
+                    Some(path) => {
+                        self.never_touch(&[path]);
+                        self.never_input.clear();
+                    }
+                    None => {
+                        self.never_error =
+                            Some("Paste the full path of a folder or file that exists.");
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => self.never_check = None,
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
         let measured = self
             .space
             .measuring
@@ -345,6 +406,7 @@ impl CleanerApp {
         self.phase = Phase::Scanning(scan::start(input, move || ctx.request_repaint()));
         self.items.clear();
         self.candidates.clear();
+        self.dupe_files.clear();
         self.finder = None;
         self.dupes_done = false;
         self.report = None;
@@ -365,9 +427,13 @@ impl CleanerApp {
         self.candidates = output.candidates;
         self.fda = output.fda;
         self.notes = output.notes;
-        if let Some(home) = &self.home {
+        self.home = output.env.as_ref().map(|e| e.home.clone());
+        self.downloads = output.env.as_ref().map(|e| e.downloads.clone());
+        if let Some(env) = &output.env {
+            let home = &env.home;
             let skipped: Vec<PathBuf> = platform::HOME_SKIP.iter().map(|s| home.join(s)).collect();
-            self.space.levels = space::from_scan(home, &output.map, output.home_files, &skipped);
+            self.space.levels =
+                space::from_scan(home, &output.map, output.home_files, &skipped, &env.cloud);
             self.space.stack = vec![home.clone()];
         }
         if self.view == View::Space {
@@ -387,20 +453,16 @@ impl CleanerApp {
 
     fn add_duplicates(&mut self, groups: Vec<Vec<dupes::Cand>>) {
         self.items.retain(|it| it.category != Category::Duplicates);
-        let env = platform::env();
+        self.dupe_files.clear();
         let now = fmt::now();
         for (g, group) in groups.into_iter().enumerate() {
             for c in group {
-                let root = env
-                    .as_ref()
-                    .map(|e| {
-                        if c.path.starts_with(&e.home) {
-                            e.home.clone()
-                        } else {
-                            e.downloads.clone()
-                        }
-                    })
-                    .unwrap_or_default();
+                // The walk root the file came from (rule S2): home, or Downloads outside it.
+                let root = match (&self.home, &self.downloads) {
+                    (Some(home), _) if c.path.starts_with(home) => home.clone(),
+                    (_, Some(downloads)) => downloads.clone(),
+                    _ => PathBuf::new(),
+                };
                 let name = c
                     .path
                     .file_name()
@@ -416,13 +478,20 @@ impl CleanerApp {
                 item.files = 1;
                 item.modified = c.mtime;
                 item.dupe_group = g as u32 + 1;
-                item.ident = Some(scan::Ident {
+                let ident = scan::Ident {
                     ino: c.ino,
                     len: c.len,
                     mtime: c.mtime,
                     dir: false,
-                });
+                };
+                item.ident = Some(ident);
                 item.finish_text(now);
+                self.dupe_files.push(clean::GroupFile {
+                    group: item.dupe_group,
+                    path: c.path.clone(),
+                    modified: c.mtime,
+                    ident,
+                });
                 self.items.push(item);
             }
         }
@@ -439,18 +508,9 @@ impl CleanerApp {
                 item: self.items[i].clone(),
             })
             .collect();
-        // Every duplicate, selected or not: cleaning keeps one copy of each group even
-        // when another category selected the others (rule S10).
-        let group_files = self
-            .items
-            .iter()
-            .filter(|it| it.category == Category::Duplicates && it.dupe_group != 0)
-            .map(|it| clean::GroupFile {
-                group: it.dupe_group,
-                path: it.paths[0].clone(),
-                modified: it.modified,
-            })
-            .collect();
+        // Every duplicate, listed or not: cleaning keeps one copy of each group even when
+        // another category selected the others (rule S10).
+        let group_files = self.dupe_files.clone();
         let ctx = ctx.clone();
         self.phase = Phase::Cleaning(clean::start(
             jobs,
@@ -487,7 +547,14 @@ impl CleanerApp {
                 it.finish_text(now);
             }
         }
-        let gone: HashSet<usize> = report.finished.iter().copied().collect();
+        // Rule S10 would refuse these again, so they no longer count as selected.
+        for &i in &report.kept {
+            if let Some(it) = self.items.get_mut(i) {
+                it.selected = false;
+            }
+        }
+        let mut gone: HashSet<usize> = report.finished.iter().copied().collect();
+        refill_trash_rows(&mut self.items, &mut gone, report.trashed, now);
         let gone_paths: HashSet<PathBuf> = gone
             .iter()
             .filter_map(|&i| self.items.get(i))
@@ -556,15 +623,26 @@ impl CleanerApp {
             .collect();
         let now = fmt::now();
         let mut back = 0;
+        let mut back_bytes = 0;
         let mut kept = Vec::new();
         for (mut item, original, in_trash) in undo.items {
             if ok.contains(&original) {
+                back_bytes += item.size;
                 item.finish_text(now);
                 self.items.push(item);
                 back += 1;
             } else {
                 kept.push((item, original, in_trash));
             }
+        }
+        // What came back left the Trash, so emptying it now deletes less.
+        for it in self
+            .items
+            .iter_mut()
+            .filter(|it| it.category == Category::Trash && it.status != Status::Unmeasured)
+        {
+            it.size = it.size.saturating_sub(back_bytes);
+            it.finish_text(now);
         }
         let first_error = results.iter().find_map(|(_, r)| r.as_ref().err().cloned());
         undo.result = Some(match first_error {
@@ -639,9 +717,13 @@ impl CleanerApp {
             } else if matches!(it.status, Status::Ok | Status::Running) {
                 s.total += it.size;
             }
-            if matches!(it.status, Status::Ok | Status::Unmeasured) && self.matches(it) {
+            if matches!(it.status, Status::Ok | Status::Unmeasured) {
                 s.bulk += 1;
                 s.bulk_selected += u64::from(it.selected);
+                if self.matches(it) {
+                    s.shown += 1;
+                    s.shown_selected += u64::from(it.selected);
+                }
             }
         }
         summary[Category::Duplicates.index()].total = groups
@@ -703,15 +785,7 @@ impl CleanerApp {
                 let (x, y) = (&self.items[a], &self.items[b]);
                 x.dupe_group.cmp(&y.dupe_group).then_with(|| order(x, y))
             });
-            let mut oldest: HashMap<u32, (i64, usize)> = HashMap::new();
-            for &i in &idx {
-                let it = &self.items[i];
-                let e = oldest.entry(it.dupe_group).or_insert((it.modified, i));
-                if it.modified < e.0 {
-                    *e = (it.modified, i);
-                }
-            }
-            self.oldest = oldest.values().map(|&(_, i)| i).collect();
+            self.oldest = oldest_copies(&self.items).into_values().collect();
             let mut last = 0;
             for i in idx {
                 let g = self.items[i].dupe_group;
@@ -733,12 +807,18 @@ impl CleanerApp {
         }
     }
 
-    fn select_category(&mut self, cat: Category, select: bool) {
+    /// Selects or clears a category. The list's buttons pass `matching_only`, so they act
+    /// on the rows the search box shows. The sidebar acts on the whole category.
+    fn select_category(&mut self, cat: Category, select: bool, matching_only: bool) {
         if cat == Category::Duplicates && select {
-            self.keep_oldest();
+            self.keep_oldest(matching_only);
             return;
         }
-        let query = self.query.to_lowercase();
+        let query = if matching_only {
+            self.query.to_lowercase()
+        } else {
+            String::new()
+        };
         let limit = self.settings.large_limit;
         for it in self.items.iter_mut().filter(|it| it.category == cat) {
             if (cat == Category::LargeFiles && it.size < limit)
@@ -755,41 +835,36 @@ impl CleanerApp {
         self.dirty = true;
     }
 
-    /// Selects every duplicate except the oldest copy of each group.
-    fn keep_oldest(&mut self) {
-        let mut oldest: HashMap<u32, (i64, usize)> = HashMap::new();
-        for (i, it) in self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.category == Category::Duplicates)
-        {
-            let entry = oldest.entry(it.dupe_group).or_insert((it.modified, i));
-            if it.modified < entry.0 {
-                *entry = (it.modified, i);
-            }
-        }
+    /// Selects every duplicate except the oldest copy of each group. The oldest is found
+    /// among all copies; with `matching_only` (the list's button), only rows that match the
+    /// search box change.
+    fn keep_oldest(&mut self, matching_only: bool) {
+        let oldest = oldest_copies(&self.items);
+        let query = self.query.to_lowercase();
         for (i, it) in self
             .items
             .iter_mut()
             .enumerate()
             .filter(|(_, it)| it.category == Category::Duplicates)
         {
-            it.selected = it.selectable()
-                && oldest
-                    .get(&it.dupe_group)
-                    .is_some_and(|&(_, keep)| keep != i);
+            if matching_only && !it.search.contains(&query) {
+                continue;
+            }
+            it.selected =
+                it.selectable() && oldest.get(&it.dupe_group).is_some_and(|&keep| keep != i);
         }
         self.dirty = true;
     }
 
-    /// Selects the build folders of projects untouched for `IDLE_DAYS` days.
+    /// Selects the build folders of projects untouched for `IDLE_DAYS` days, among the rows
+    /// that match the search box.
     fn select_idle_projects(&mut self) {
         let cutoff = fmt::now() - IDLE_DAYS * 86_400;
+        let query = self.query.to_lowercase();
         for it in self
             .items
             .iter_mut()
-            .filter(|it| it.category == Category::BuildFolders)
+            .filter(|it| it.category == Category::BuildFolders && it.search.contains(&query))
         {
             if it.status == Status::Ok && it.modified > 0 && it.modified < cutoff {
                 it.selected = true;
@@ -819,6 +894,19 @@ impl CleanerApp {
         });
         self.candidates.retain(|c| !covered(&c.path));
         self.drop_lonely_duplicates();
+        // The Space map stops listing, and so opening and walking, what is covered (S12).
+        let space = &mut self.space;
+        space.levels.retain(|path, _| !covered(path));
+        for level in space.levels.values_mut() {
+            level.nodes.retain(|n| !covered(&n.path));
+        }
+        if let Some(i) = space.stack.iter().position(|p| covered(p)) {
+            space.stack.truncate(i);
+        }
+        if space.pending.as_ref().is_some_and(|p| covered(p)) {
+            space.pending = None;
+        }
+        space.rows_for = None;
         self.current = None;
         self.dirty = true;
     }
@@ -963,7 +1051,7 @@ impl CleanerApp {
             let (cleanable, category) = self.cleanable_in(&n.path);
             let (note, note_color) = if n.protected {
                 (
-                    "Not measured: protected by macOS privacy settings or synced to the cloud."
+                    "Not measured: synced to the cloud, or protected by privacy settings."
                         .to_owned(),
                     MUTED,
                 )
@@ -1059,9 +1147,11 @@ impl CleanerApp {
                         ui.add_enabled(false, Button::new("Scan").min_size(vec2(92.0, 30.0)));
                     }
                     Phase::Idle if self.scanned => {
+                        // A new scan drops the result of a Put back that is still running.
+                        let restoring = self.undo.as_ref().is_some_and(|u| u.running.is_some());
                         start = ui
                             .add_enabled(
-                                self.finder.is_none(),
+                                self.finder.is_none() && !restoring && self.never_check.is_none(),
                                 Button::new("Scan again").min_size(vec2(104.0, 30.0)),
                             )
                             .clicked();
@@ -1137,7 +1227,7 @@ impl CleanerApp {
                         open = Some(cat);
                     }
                     if checked {
-                        toggle = Some((cat, !all));
+                        toggle = Some((cat, s.click_selects(cat)));
                     }
                 }
             });
@@ -1152,7 +1242,7 @@ impl CleanerApp {
             self.dirty = true;
         }
         if let Some((cat, select)) = toggle {
-            self.select_category(cat, select);
+            self.select_category(cat, select, false);
         }
     }
 
@@ -1221,7 +1311,7 @@ impl CleanerApp {
             ui.add_space(20.0);
             start = ui
                 .add_enabled(
-                    !self.elevated,
+                    !self.elevated && self.never_check.is_none(),
                     primary("Scan").min_size(vec2(150.0, 38.0)),
                 )
                 .clicked();
@@ -1287,13 +1377,18 @@ impl CleanerApp {
                     )
                     .changed();
                 if cat == Category::Duplicates {
-                    if self.dupes_done && s.bulk > 0 {
+                    if self.dupes_done && s.shown > 0 {
                         keep = ui
                             .add_enabled(idle, Button::new("Select all but the oldest"))
                             .clicked();
+                        if s.shown_selected > 0
+                            && ui.add_enabled(idle, Button::new("Select none")).clicked()
+                        {
+                            select = Some(false);
+                        }
                     }
-                } else if s.bulk > 0 {
-                    let all = s.bulk_selected == s.bulk;
+                } else if s.shown > 0 {
+                    let all = s.shown_selected == s.shown;
                     if ui
                         .add_enabled(
                             idle,
@@ -1339,10 +1434,10 @@ impl CleanerApp {
             self.dirty = true;
         }
         if let Some(select) = select {
-            self.select_category(cat, select);
+            self.select_category(cat, select, true);
         }
         if keep {
-            self.keep_oldest();
+            self.keep_oldest(true);
         }
         if idle_projects {
             self.select_idle_projects();
@@ -1805,7 +1900,9 @@ impl CleanerApp {
                 Phase::Idle => {}
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let can = self.idle() && self.chosen_count > 0 && !self.elevated;
+                // Put back adds rows when it ends; a clean meanwhile would replace its result.
+                let restoring = self.undo.as_ref().is_some_and(|u| u.running.is_some());
+                let can = self.idle() && !restoring && self.chosen_count > 0 && !self.elevated;
                 clean = ui
                     .add_enabled(can, primary(&self.clean_label).min_size(vec2(130.0, 32.0)))
                     .clicked();
@@ -2024,7 +2121,8 @@ impl CleanerApp {
                     });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let edit = ui.add(
+                    let edit = ui.add_enabled(
+                        self.never_check.is_none(),
                         TextEdit::singleline(&mut self.never_input)
                             .hint_text("Paste a folder or file path")
                             .desired_width(380.0),
@@ -2035,7 +2133,9 @@ impl CleanerApp {
                         .on_disabled_hover_text(BUSY_NEVER);
                     add = idle && (button.clicked() || enter);
                 });
-                if let Some(error) = self.never_error {
+                if self.never_check.is_some() {
+                    ui.label(RichText::new("Checking the path…").small().color(MUTED));
+                } else if let Some(error) = self.never_error {
                     ui.label(RichText::new(error).small().color(WARNING));
                 }
                 ui.add_space(14.0);
@@ -2048,22 +2148,21 @@ impl CleanerApp {
             self.settings.save();
         }
         if add {
-            let text = self.never_input.trim().trim_matches('"');
-            // The scan lists canonical paths: `\\?\C:\…` on Windows, the on-disk letter
-            // case on macOS. A path typed any other way would never match.
-            match Path::new(text)
-                .is_absolute()
-                .then(|| std::fs::canonicalize(text))
-            {
-                Some(Ok(path)) => {
-                    self.never_touch(&[path]);
-                    self.never_input.clear();
-                    self.never_error = None;
-                }
-                _ => {
-                    self.never_error = Some("Paste the full path of a folder or file that exists.")
-                }
-            }
+            let text = self.never_input.trim().trim_matches('"').to_owned();
+            let (tx, rx) = mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                // The scan lists canonical paths: `\\?\C:\…` on Windows, the on-disk letter
+                // case on macOS. A path typed any other way would never match.
+                let path = Path::new(&text)
+                    .is_absolute()
+                    .then(|| std::fs::canonicalize(&text).ok())
+                    .flatten();
+                let _ = tx.send(path);
+                ctx.request_repaint();
+            });
+            self.never_check = Some(rx);
+            self.never_error = None;
         }
         if close || response.should_close() {
             self.settings_open = false;
@@ -2075,6 +2174,10 @@ impl CleanerApp {
 impl eframe::App for CleanerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::settings::flush();
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -2130,6 +2233,48 @@ impl eframe::App for CleanerApp {
         if self.busy() {
             ctx.request_repaint_after(BUSY_REPAINT);
         }
+    }
+}
+
+/// The oldest copy of each duplicate group, as group → index in `items`. A tie goes to the
+/// smaller path, as when cleaning keeps a copy. "Select all but the oldest" and the
+/// "oldest" tag both use this, so they always agree.
+fn oldest_copies(items: &[Item]) -> HashMap<u32, usize> {
+    let mut oldest: HashMap<u32, usize> = HashMap::new();
+    for (i, it) in items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.category == Category::Duplicates)
+    {
+        let keep = oldest.entry(it.dupe_group).or_insert(i);
+        let current = &items[*keep];
+        if (it.modified, &it.paths[0]) < (current.modified, &current.paths[0]) {
+            *keep = i;
+        }
+    }
+    oldest
+}
+
+/// Files that a clean moved to the Trash sit there now, so emptying it would delete them
+/// for good too. Adds their bytes to the Trash row. A Trash row that the same clean emptied
+/// (it is in `gone`) stays, unselected, holding just those files.
+fn refill_trash_rows(items: &mut [Item], gone: &mut HashSet<usize>, bytes: u64, now: i64) {
+    if bytes == 0 {
+        return;
+    }
+    for (i, it) in items
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, it)| it.category == Category::Trash)
+    {
+        if gone.remove(&i) {
+            it.size = 0;
+            it.selected = false;
+        }
+        if it.status != Status::Unmeasured {
+            it.size += bytes;
+        }
+        it.finish_text(now);
     }
 }
 
@@ -2344,4 +2489,327 @@ fn report_line(ui: &mut Ui, what: &str, value: &str) {
             ui.label(RichText::new(value).color(TEXT).strong())
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row of `cat` named `name`, with the text the search box reads.
+    fn row(cat: Category, name: &str, selected: bool) -> Item {
+        let mut it = Item::new(
+            cat,
+            name,
+            vec![PathBuf::from("/h").join(name)],
+            PathBuf::from("/h"),
+            Shape::Entry,
+        );
+        it.size = 1_000;
+        it.selected = selected;
+        it.finish_text(0);
+        it
+    }
+
+    /// A copy in a duplicate group.
+    fn copy(name: &str, group: u32, modified: i64, selected: bool) -> Item {
+        let mut it = row(Category::Duplicates, name, selected);
+        it.dupe_group = group;
+        it.modified = modified;
+        it
+    }
+
+    /// The names of the selected rows, sorted.
+    fn selected(app: &CleanerApp) -> Vec<String> {
+        let mut names: Vec<String> = app
+            .items
+            .iter()
+            .filter(|it| it.selected)
+            .map(|it| it.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_search_leaves_the_sidebar_alone() {
+        let mut app = CleanerApp::blank(Settings::default());
+        app.items = vec![
+            row(Category::SystemJunk, "alpha", true),
+            row(Category::SystemJunk, "beta", true),
+        ];
+        // Typed while another category is on screen.
+        app.view = View::Category(Category::OldDownloads);
+        app.query = "zzz".to_owned();
+        app.recompute();
+        let s = &app.summary[Category::SystemJunk.index()];
+        assert_eq!((s.bulk, s.bulk_selected, s.shown), (2, 2, 0));
+        assert!(!s.click_selects(Category::SystemJunk), "a click clears");
+        // The list's button acts on the rows the search shows.
+        app.query = "alpha".to_owned();
+        app.select_category(Category::SystemJunk, false, true);
+        assert_eq!(selected(&app), ["beta"]);
+        // The sidebar acts on the whole category.
+        app.select_category(Category::SystemJunk, true, false);
+        assert_eq!(selected(&app), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn the_duplicates_checkbox_selects_then_clears() {
+        let mut app = CleanerApp::blank(Settings::default());
+        app.items = vec![
+            copy("a/x.bin", 1, 10, false),
+            copy("b/x.bin", 1, 20, false),
+            copy("a/y.bin", 2, 10, false),
+            copy("b/y.bin", 2, 20, false),
+        ];
+        app.recompute();
+        let cat = Category::Duplicates;
+        assert!(app.summary[cat.index()].click_selects(cat));
+        app.select_category(cat, true, false);
+        assert_eq!(selected(&app), ["b/x.bin", "b/y.bin"], "all but the oldest");
+        app.recompute();
+        assert!(
+            !app.summary[cat.index()].click_selects(cat),
+            "a second click clears"
+        );
+        app.select_category(cat, false, false);
+        assert!(selected(&app).is_empty());
+        // "Select all but the oldest" in the list follows the search.
+        app.query = "x.bin".to_owned();
+        app.keep_oldest(true);
+        assert_eq!(selected(&app), ["b/x.bin"]);
+    }
+
+    #[test]
+    fn idle_projects_follow_the_search() {
+        let mut app = CleanerApp::blank(Settings::default());
+        let idle = |name: &str| {
+            let mut it = row(Category::BuildFolders, name, false);
+            it.modified = 1;
+            it
+        };
+        app.items = vec![idle("app/node_modules"), idle("web/node_modules")];
+        app.query = "app/".to_owned();
+        app.select_idle_projects();
+        assert_eq!(selected(&app), ["app/node_modules"]);
+    }
+
+    #[test]
+    fn never_touch_leaves_the_space_map() {
+        let home = crate::rules::tests::tempdir("app-never");
+        let documents = home.join("Documents");
+        let taxes = documents.join("Taxes");
+        let node = |path: &Path| space::Node {
+            path: path.to_path_buf(),
+            name: String::new(),
+            size: 1,
+            files: 1,
+            protected: false,
+            measured: true,
+        };
+        let level = |path: &Path, nodes| space::Level {
+            path: path.to_path_buf(),
+            nodes,
+            loose: 0,
+        };
+        let mut app = CleanerApp::blank(Settings::default());
+        let other = documents.join("Other");
+        app.space.levels.insert(
+            documents.clone(),
+            level(&documents, vec![node(&taxes), node(&other)]),
+        );
+        app.space
+            .levels
+            .insert(taxes.clone(), level(&taxes, Vec::new()));
+        app.space.stack = vec![home.clone(), documents.clone(), taxes.clone()];
+        app.never_touch(std::slice::from_ref(&taxes));
+        assert!(!app.space.levels.contains_key(&taxes));
+        let names: Vec<&Path> = app.space.levels[&documents]
+            .nodes
+            .iter()
+            .map(|n| n.path.as_path())
+            .collect();
+        assert_eq!(names, [other.as_path()]);
+        assert_eq!(app.space.stack, [home, documents], "back out of the folder");
+    }
+
+    #[test]
+    fn a_finished_scan_gives_the_app_its_folders() {
+        let mut app = CleanerApp::blank(Settings::default());
+        let home = crate::rules::tests::tempdir("app-scan");
+        let downloads = home.parent().unwrap().join("elsewhere-downloads");
+        let output = scan::Output {
+            items: Vec::new(),
+            candidates: Vec::new(),
+            fda: None,
+            notes: Vec::new(),
+            map: Vec::new(),
+            home_files: 0,
+            env: Some(crate::rules::Env {
+                home: home.clone(),
+                temp: home.join("tmp"),
+                downloads: downloads.clone(),
+                local: home.join("Library"),
+                cloud: vec![home.join("Dropbox")],
+            }),
+        };
+        app.finish_scan(output, &egui::Context::default());
+        assert_eq!(app.home.as_ref(), Some(&home));
+        assert_eq!(app.space.stack.len(), 1);
+        assert_eq!(app.space.stack[0], home);
+        assert!(
+            app.space.levels[&home].nodes[0].protected,
+            "the sync folder"
+        );
+        // Each duplicate belongs to the walk root it came from (rule S2).
+        let cand = |path: PathBuf| dupes::Cand {
+            path,
+            len: 1,
+            ino: 0,
+            mtime: 0,
+        };
+        app.add_duplicates(vec![vec![
+            cand(home.join("a.bin")),
+            cand(downloads.join("a.bin")),
+        ]]);
+        let roots: Vec<&Path> = app.items.iter().map(|it| it.root.as_path()).collect();
+        assert_eq!(roots, [home.as_path(), downloads.as_path()]);
+        assert_eq!(app.dupe_files.len(), 2);
+    }
+
+    #[test]
+    fn a_clean_report_updates_the_rows() {
+        let mut app = CleanerApp::blank(Settings::default());
+        let mut trash = Item::new(
+            Category::Trash,
+            "Trash",
+            vec![PathBuf::from("/h/.Trash")],
+            PathBuf::new(),
+            Shape::Contents,
+        );
+        trash.size = 120;
+        trash.selected = true;
+        app.items = vec![
+            trash,
+            row(Category::LargeFiles, "big.iso", true),
+            copy("a/x.bin", 1, 10, true),
+            copy("b/x.bin", 1, 20, false),
+        ];
+        app.dupe_files = app.items[2..]
+            .iter()
+            .map(|it| clean::GroupFile {
+                group: it.dupe_group,
+                path: it.paths[0].clone(),
+                modified: it.modified,
+                ident: scan::Ident {
+                    ino: 0,
+                    len: 0,
+                    mtime: 0,
+                    dir: false,
+                },
+            })
+            .collect();
+        // The Trash was emptied, big.iso went in, and rule S10 refused the oldest copy.
+        let report = clean::Report {
+            trashed: 1_000,
+            finished: vec![0, 1],
+            kept: vec![2],
+            moved: vec![(1, PathBuf::from("/h/big.iso"), None)],
+            ..clean::Report::default()
+        };
+        app.apply_report(report, &egui::Context::default());
+        assert_eq!(selected(&app), Vec::<String>::new(), "nothing stays ticked");
+        assert!(!app.items.iter().any(|it| it.name == "big.iso"));
+        let row = app.items.iter().find(|it| it.category == Category::Trash);
+        assert_eq!(
+            row.map(|it| it.size),
+            Some(1_000),
+            "the row holds big.iso now"
+        );
+        assert_eq!(app.dupe_files.len(), 2, "rule S10 still counts every copy");
+        assert_eq!(app.undo.as_ref().map(|u| u.items.len()), Some(1));
+    }
+
+    #[test]
+    fn put_back_shrinks_the_trash_row() {
+        let mut app = CleanerApp::blank(Settings::default());
+        let mut trash = Item::new(
+            Category::Trash,
+            "Trash",
+            vec![PathBuf::from("/h/.Trash")],
+            PathBuf::new(),
+            Shape::Contents,
+        );
+        trash.size = 1_000;
+        app.items = vec![trash];
+        let big = row(Category::LargeFiles, "big.iso", false);
+        let original = big.paths[0].clone();
+        app.undo = Some(Undo {
+            items: vec![(big, original.clone(), None)],
+            since: 0,
+            running: None,
+            result: None,
+        });
+        app.apply_restore(vec![(original, Ok(()))]);
+        assert_eq!(app.items[0].size, 0, "what came back left the Trash");
+        assert!(app.items.iter().any(|it| it.name == "big.iso"));
+    }
+
+    #[test]
+    fn the_trash_row_grows_by_what_a_clean_moved_there() {
+        let mut trash = Item::new(
+            Category::Trash,
+            "Trash",
+            vec![PathBuf::from("/h/.Trash")],
+            PathBuf::new(),
+            Shape::Contents,
+        );
+        trash.size = 120;
+        let file = Item::new(
+            Category::LargeFiles,
+            "a.iso",
+            vec![PathBuf::from("/h/a.iso")],
+            PathBuf::from("/h"),
+            Shape::Entry,
+        );
+        let mut items = vec![trash, file];
+        refill_trash_rows(&mut items, &mut HashSet::new(), 1_900, 0);
+        assert_eq!(items[0].size, 2_020);
+        assert_eq!(items[1].size, 0);
+
+        // The same clean emptied the Trash first: the row stays, holding just the new files.
+        items[0].selected = true;
+        let mut gone = HashSet::from([0, 1]);
+        refill_trash_rows(&mut items, &mut gone, 500, 0);
+        assert_eq!(items[0].size, 500);
+        assert!(
+            !items[0].selected,
+            "so the next clean does not empty it again"
+        );
+        assert_eq!(gone, HashSet::from([1]));
+    }
+
+    #[test]
+    fn the_oldest_copy_wins_ties_by_path() {
+        let copy = |path: &str, modified: i64| {
+            let mut it = Item::new(
+                Category::Duplicates,
+                path,
+                vec![PathBuf::from(path)],
+                PathBuf::from("/h"),
+                Shape::Entry,
+            );
+            it.dupe_group = 1;
+            it.modified = modified;
+            it
+        };
+        // Equal times, as when one archive was unzipped twice: the smaller path wins,
+        // wherever the rows sit in the list.
+        let items = [
+            copy("/h/b/zeta.bin", 10),
+            copy("/h/a/alpha.bin", 10),
+            copy("/h/c/new.bin", 5_000),
+        ];
+        assert_eq!(oldest_copies(&items)[&1], 1);
+    }
 }

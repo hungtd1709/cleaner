@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::fmt;
 use crate::platform;
-use crate::rules::{self, Action, Guard};
-use crate::scan::{Ident, Item, Shape, Status, mtime_of};
+use crate::rules::{self, Action, Category, Guard};
+use crate::scan::{self, Ident, Item, Shape, Status, mtime_of};
 
 /// The report lists at most this many skipped paths.
 const MAX_SKIPPED: usize = 500;
@@ -21,11 +21,14 @@ pub struct Job {
     pub item: Item,
 }
 
-/// One file of a duplicate group in the app's list, selected or not.
+/// One file of a duplicate group as the search found it, listed or not.
+#[derive(Clone)]
 pub struct GroupFile {
     pub group: u32,
     pub path: PathBuf,
     pub modified: i64,
+    /// What the search saw. An unselected copy counts as kept only if it still matches.
+    pub ident: Ident,
 }
 
 #[derive(Default)]
@@ -55,6 +58,9 @@ pub struct Report {
     pub refused: Option<String>,
     /// Items moved to the Trash: (item index, original path, path in the Trash).
     pub moved: Vec<(usize, PathBuf, Option<PathBuf>)>,
+    /// Items left alone because they hold the last copy of a duplicate group (rule S10).
+    /// A new clean would refuse them again, so the app unselects them.
+    pub kept: Vec<usize>,
     /// When cleaning started, in seconds since 1970. Undo looks for items from then on.
     pub started: i64,
 }
@@ -100,6 +106,8 @@ struct Outcome {
     complete: bool,
     /// For a move to the Trash: the original path and where it went.
     moved: Option<(PathBuf, Option<PathBuf>)>,
+    /// Left alone because it holds the last copy of a duplicate group (rule S10).
+    kept: bool,
 }
 
 pub fn run(
@@ -134,7 +142,7 @@ pub fn run(
     report.free_before = platform::system_disk().map(|d| d.free);
 
     let mut outcomes: Vec<(usize, Outcome)> = Vec::new();
-    let (jobs, followers) = normalize(jobs, group_files, &mut outcomes);
+    let (jobs, followers) = normalize(jobs, group_files, &mut outcomes, &on_disk);
     progress.total.store(jobs.len(), Relaxed);
     let (deletes, others): (Vec<&Job>, Vec<&Job>) =
         jobs.iter().partition(|j| j.item.action() == Action::Delete);
@@ -163,7 +171,7 @@ pub fn run(
     outcomes.extend(done.into_inner().unwrap_or_else(|p| p.into_inner()));
 
     // Trash moves and emptying run one at a time on this thread.
-    for job in others {
+    for job in trash_order(others) {
         if cancel.load(Relaxed) {
             break;
         }
@@ -184,6 +192,9 @@ pub fn run(
         if let Some((original, in_trash)) = outcome.moved {
             report.moved.push((index, original, in_trash));
         }
+        if outcome.kept {
+            report.kept.push(index);
+        }
         if outcome.complete {
             report.finished.push(index);
         } else if outcome.removed + outcome.trashed > 0 {
@@ -202,6 +213,15 @@ pub fn run(
     report
 }
 
+/// Puts emptying the Trash first. Emptying it later would delete for good the user files
+/// that this clean just moved there, such as Xcode archives (rule S5).
+fn trash_order(jobs: Vec<&Job>) -> Vec<&Job> {
+    let (empties, moves): (Vec<&Job>, Vec<&Job>) = jobs
+        .into_iter()
+        .partition(|j| j.item.action() == Action::EmptyTrash);
+    empties.into_iter().chain(moves).collect()
+}
+
 /// Keeps one file of every duplicate group (rule S10), and drops items inside another
 /// selected item. A dropped item becomes a "follower": it is done only if the item that
 /// covers it is done (see `resolve_followers`).
@@ -209,8 +229,9 @@ fn normalize(
     mut jobs: Vec<Job>,
     group_files: &[GroupFile],
     outcomes: &mut Vec<(usize, Outcome)>,
+    on_disk: &dyn Fn(&GroupFile) -> bool,
 ) -> (Vec<Job>, Vec<(usize, PathBuf)>) {
-    let keep = keep_last_copies(&jobs, group_files);
+    let keep = keep_last_copies(&jobs, group_files, on_disk);
     let mut index = 0;
     jobs.retain(|job| {
         let why = keep.get(&index);
@@ -218,6 +239,7 @@ fn normalize(
         if let Some(&why) = why {
             let outcome = Outcome {
                 skipped: vec![(job.item.paths[0].clone(), why.to_owned())],
+                kept: true,
                 ..Outcome::default()
             };
             outcomes.push((job.index, outcome));
@@ -250,10 +272,20 @@ fn normalize(
     (jobs, followers)
 }
 
+/// A duplicate is still on disk as the search saw it.
+fn on_disk(f: &GroupFile) -> bool {
+    ident_ok(&f.path, Some(f.ident), true)
+}
+
 /// Rule S10: one file of every duplicate group stays, whichever category selected the
-/// others. A file goes if a job removes its path or a folder that holds it. Returns the
-/// jobs (by position) that must not run, with the reason.
-fn keep_last_copies(jobs: &[Job], group_files: &[GroupFile]) -> HashMap<usize, &'static str> {
+/// others. A file goes if a job removes its path or a folder that holds it. Only files
+/// that `on_disk` accepts count: a copy deleted or edited since the search is no copy.
+/// Returns the jobs (by position) that must not run, with the reason.
+fn keep_last_copies(
+    jobs: &[Job],
+    group_files: &[GroupFile],
+    on_disk: &dyn Fn(&GroupFile) -> bool,
+) -> HashMap<usize, &'static str> {
     let mut by_path: HashMap<&Path, Vec<usize>> = HashMap::new();
     for (i, job) in jobs.iter().enumerate() {
         if job.item.shape == Shape::Entry {
@@ -269,7 +301,7 @@ fn keep_last_copies(jobs: &[Job], group_files: &[GroupFile]) -> HashMap<usize, &
     }
     let mut dropped: HashMap<usize, &'static str> = HashMap::new();
     for files in groups.values() {
-        // The jobs that would remove each file. One file that no job removes is enough.
+        // The jobs that would remove each file.
         let removers: Vec<Vec<usize>> = files
             .iter()
             .map(|f| {
@@ -282,17 +314,22 @@ fn keep_last_copies(jobs: &[Job], group_files: &[GroupFile]) -> HashMap<usize, &
                     .collect()
             })
             .collect();
-        if removers.iter().any(Vec::is_empty) {
+        let copy: Vec<bool> = files.iter().map(|f| on_disk(f)).collect();
+        // One copy that no job removes is enough.
+        if (0..files.len()).any(|k| removers[k].is_empty() && copy[k]) {
             continue;
         }
-        // Keep the oldest file, preferring one that no selected folder holds, so that
-        // the folder can still go.
-        let Some(keep) = (0..files.len()).min_by_key(|&k| {
-            let in_folder = removers[k]
-                .iter()
-                .any(|&j| jobs[j].item.paths[0] != files[k].path);
-            (in_folder, files[k].modified, &files[k].path)
-        }) else {
+        // Keep the oldest copy that a job would remove, preferring one that no selected
+        // folder holds, so that the folder can still go.
+        let Some(keep) = (0..files.len())
+            .filter(|&k| !removers[k].is_empty() && copy[k])
+            .min_by_key(|&k| {
+                let in_folder = removers[k]
+                    .iter()
+                    .any(|&j| jobs[j].item.paths[0] != files[k].path);
+                (in_folder, files[k].modified, &files[k].path)
+            })
+        else {
             continue;
         };
         for &j in &removers[keep] {
@@ -334,7 +371,9 @@ fn resolve_followers(
     }
 }
 
-/// Same identity, not a link. For user files (`strict`), also the same size and time.
+/// Same identity, not a link. For user files (`strict`), also the same time, and for a file
+/// the same size. A folder's own time changes when an entry directly inside it is added,
+/// removed or renamed.
 fn ident_ok(path: &Path, ident: Option<Ident>, strict: bool) -> bool {
     let Ok(md) = fs::symlink_metadata(path) else {
         return false;
@@ -353,7 +392,20 @@ fn ident_ok(path: &Path, ident: Option<Ident>, strict: bool) -> bool {
             return false;
         }
     }
-    !(strict && !id.dir && (md.len() != id.len || mtime_of(&md) != id.mtime))
+    // Windows: only duplicates carry a file id (the search reads it). Reading it costs an
+    // open, so items without one skip this.
+    #[cfg(windows)]
+    if id.ino != 0 && platform::file_index(path) != Some(id.ino) {
+        return false;
+    }
+    if !strict {
+        return true;
+    }
+    if id.dir {
+        // Compared as the parent folder lists it, which is where the scan read it.
+        return platform::listed_mtime(path).unwrap_or_else(|| mtime_of(&md)) == id.mtime;
+    }
+    md.len() == id.len && mtime_of(&md) == id.mtime
 }
 
 fn delete_item(
@@ -392,6 +444,8 @@ fn delete_item(
                 d.skip(path, why);
             } else if !ident_ok(path, item.ident, false) {
                 d.skip(path, "it changed since the scan");
+            } else if item.category == Category::BuildFolders && !scan::still_build_folder(path) {
+                d.skip(path, "it is no longer a build folder");
             } else {
                 d.volume = fs::symlink_metadata(&item.root)
                     .ok()
@@ -537,7 +591,19 @@ impl Deleter<'_> {
                 if fs::rename(path, &moved).is_err() {
                     return self.skip(path, "in use by another app");
                 }
-                self.tree(&moved, 0);
+                let first = self.skipped.len();
+                // What could not go gets its own name back, so its app still finds it.
+                if !self.tree(&moved, 0) && fs::rename(&moved, path).is_ok() {
+                    for (skipped, _) in &mut self.skipped[first..] {
+                        if let Ok(rest) = skipped.strip_prefix(&moved) {
+                            *skipped = if rest.as_os_str().is_empty() {
+                                path.to_path_buf()
+                            } else {
+                                path.join(rest)
+                            };
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -579,7 +645,7 @@ impl Deleter<'_> {
             return false;
         }
         if ft.is_file() {
-            if self.cutoff != 0 && newest(&md) > self.cutoff {
+            if self.cutoff != 0 && is_young(path, &md, self.cutoff) {
                 return false;
             }
             return self.unlink(path, platform::alloc_size(&md), false);
@@ -656,13 +722,16 @@ fn renamed(path: &Path) -> PathBuf {
     }
 }
 
-fn newest(md: &fs::Metadata) -> i64 {
+/// Changed, created or (macOS) added after `cutoff`, as the scan's age limits count. A file
+/// moved into a folder keeps its old times, but its "date added" is new.
+fn is_young(path: &Path, md: &fs::Metadata, cutoff: i64) -> bool {
     let created = md
         .created()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs() as i64);
-    mtime_of(md).max(created)
+    mtime_of(md).max(created) > cutoff
+        || platform::added_time(path).is_some_and(|added| added > cutoff)
 }
 
 #[cfg(windows)]
@@ -684,7 +753,15 @@ fn is_special(md: &fs::Metadata) -> bool {
     md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !md.file_type().is_symlink()
 }
 
-#[cfg(not(windows))]
+/// macOS cloud-only ("dataless") files and folders. Never touched (rule S6): removing one
+/// would remove it in the cloud too.
+#[cfg(target_os = "macos")]
+fn is_special(md: &fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    md.st_flags() & crate::scan::list_macos::SF_DATALESS != 0
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn is_special(_md: &fs::Metadata) -> bool {
     false
 }
@@ -730,6 +807,7 @@ mod tests {
             keep: Vec::new(),
             note: "",
             watch_recent: false,
+            apps_only: false,
         };
         let guard = Guard::new(&env, std::slice::from_ref(&target), &[]);
         (dir, guard, HashSet::from([root.clone()]), root)
@@ -746,6 +824,182 @@ mod tests {
         );
         item.ident = None;
         item
+    }
+
+    /// What a scan would record for `path`.
+    fn ident_of(path: &Path) -> Ident {
+        let md = std::fs::symlink_metadata(path).unwrap();
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(&md);
+        #[cfg(not(unix))]
+        let ino = 0;
+        Ident {
+            ino,
+            len: md.len(),
+            mtime: mtime_of(&md),
+            dir: md.is_dir(),
+        }
+    }
+
+    /// What the search saw of a copy that a job removes: never compared.
+    const NOT_CHECKED: Ident = Ident {
+        ino: 0,
+        len: 0,
+        mtime: 0,
+        dir: false,
+    };
+
+    /// Dates a file `days` back: changed, created, and on macOS also "date added".
+    fn age(path: &Path, days: u64) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        let times = std::fs::FileTimes::new().set_modified(past);
+        #[cfg(target_os = "macos")]
+        let times = std::os::macos::fs::FileTimesExt::set_created(times, past);
+        #[cfg(windows)]
+        let times = std::os::windows::fs::FileTimesExt::set_created(times, past);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        set_added(path, past);
+    }
+
+    /// Sets when a file arrived in its folder ("date added", macOS only).
+    #[cfg(target_os = "macos")]
+    fn set_added(path: &Path, when: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt;
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut list = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: libc::ATTR_CMN_ADDEDTIME,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: 0,
+        };
+        let mut time = libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid C string, attribute list, and buffer of the size passed.
+        let r = unsafe {
+            libc::setattrlist(
+                c.as_ptr(),
+                (&raw mut list).cast(),
+                (&raw mut time).cast(),
+                std::mem::size_of::<libc::timespec>(),
+                libc::FSOPT_NOFOLLOW,
+            )
+        };
+        assert_eq!(r, 0, "setattrlist: {}", std::io::Error::last_os_error());
+    }
+
+    #[test]
+    fn empties_the_trash_before_moving_files_there() {
+        let job = |index: usize, category: Category| Job {
+            index,
+            item: Item::new(
+                category,
+                "x",
+                vec![PathBuf::from("/h/x")],
+                PathBuf::from("/h"),
+                Shape::Entry,
+            ),
+        };
+        // Xcode Archives come before the Trash row in the list.
+        let jobs = [
+            job(0, Category::XcodeArchives),
+            job(1, Category::Trash),
+            job(2, Category::LargeFiles),
+        ];
+        let order: Vec<usize> = trash_order(jobs.iter().collect())
+            .iter()
+            .map(|j| j.index)
+            .collect();
+        assert_eq!(order, [1, 0, 2]);
+    }
+
+    #[test]
+    fn keeps_claude_code_memory_when_removing_old_sessions() {
+        clean_old_sessions("clean-claude", false);
+        #[cfg(unix)]
+        clean_old_sessions("clean-claude-link", true);
+    }
+
+    /// Removes old Claude Code sessions. With `linked`, `~/.claude` is a link into a
+    /// dotfiles folder, and the target root is the resolved path.
+    fn clean_old_sessions(tag: &str, linked: bool) {
+        let dir = tempdir(tag);
+        let home = dir.join("home");
+        let real = if linked {
+            home.join("dotfiles/claude")
+        } else {
+            home.join(".claude")
+        };
+        let project = real.join("projects/-Users-me-app");
+        std::fs::create_dir_all(project.join("memory")).unwrap();
+        #[cfg(unix)]
+        if linked {
+            std::os::unix::fs::symlink(&real, home.join(".claude")).unwrap();
+        }
+        let projects = std::fs::canonicalize(home.join(".claude/projects")).unwrap();
+        let note = project.join("memory/MEMORY.md");
+        let session = project.join("old-session.jsonl");
+        for file in [&note, &session] {
+            std::fs::write(file, b"x").unwrap();
+            age(file, 40);
+        }
+        let env = Env {
+            home: home.clone(),
+            temp: home.join("tmp"),
+            downloads: home.join("Downloads"),
+            local: home.join("Library"),
+            cloud: Vec::new(),
+        };
+        let target = Target {
+            category: Category::AppData,
+            name: "Claude Code sessions".into(),
+            roots: vec![projects.clone()],
+            mode: Mode::Whole,
+            filter: Filter::Any,
+            min_age_days: 30,
+            app_id: None,
+            selected: false,
+            keep: Vec::new(),
+            note: "",
+            watch_recent: true,
+            apps_only: false,
+        };
+        let guard = Guard::new(&env, std::slice::from_ref(&target), &[]);
+        let mut item = Item::new(
+            Category::AppData,
+            "sessions",
+            vec![projects.clone()],
+            PathBuf::new(),
+            Shape::Contents,
+        );
+        item.min_age_days = 30;
+        let out = delete_item(
+            &item,
+            &guard,
+            &HashSet::from([projects.clone()]),
+            &AtomicBool::new(false),
+            &Progress::default(),
+        );
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        assert!(!session.exists(), "an old session goes");
+        assert!(
+            note.exists(),
+            "a memory note stays, however old (linked: {linked})"
+        );
     }
 
     #[test]
@@ -809,19 +1063,7 @@ mod tests {
         std::fs::write(logs.join("new.log"), b"new").unwrap();
         let old = logs.join("old.log");
         std::fs::write(&old, b"old").unwrap();
-        let ten_days_ago =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
-        let times = std::fs::FileTimes::new().set_modified(ten_days_ago);
-        #[cfg(target_os = "macos")]
-        let times = std::os::macos::fs::FileTimesExt::set_created(times, ten_days_ago);
-        #[cfg(windows)]
-        let times = std::os::windows::fs::FileTimesExt::set_created(times, ten_days_ago);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_times(times)
-            .unwrap();
+        age(&old, 10);
 
         let mut item = entry_item(&root, "logs");
         item.min_age_days = 7;
@@ -853,6 +1095,81 @@ mod tests {
             !out.skipped.is_empty() && root.exists(),
             "a root is never removed"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn keeps_old_files_that_arrived_recently() {
+        let (_dir, guard, roots, root) = setup("clean-arrived");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let moved = logs.join("moved.log");
+        std::fs::write(&moved, b"x").unwrap();
+        age(&moved, 10);
+        // Moved into the folder just now: the scan counts it as new, so cleaning must too.
+        set_added(&moved, std::time::SystemTime::now());
+        let mut item = entry_item(&root, "logs");
+        item.min_age_days = 7;
+        delete_item(
+            &item,
+            &guard,
+            &roots,
+            &AtomicBool::new(false),
+            &Progress::default(),
+        );
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn a_user_folder_must_keep_its_time() {
+        let dir = tempdir("clean-folder-time");
+        let folder = dir.join("Taxes 2023");
+        std::fs::create_dir_all(&folder).unwrap();
+        // What the scan records: the folder's entry in its parent's listing.
+        let listed = crate::scan::walk::list(&dir).unwrap();
+        let entry = listed.iter().find(|e| e.name == "Taxes 2023").unwrap();
+        let mut seen = Ident {
+            ino: entry.ino,
+            len: 0,
+            mtime: entry.mtime,
+            dir: true,
+        };
+        assert!(ident_ok(&folder, Some(seen), true));
+        // The scan saw the folder before a file was saved into it.
+        seen.mtime -= 60;
+        assert!(!ident_ok(&folder, Some(seen), true));
+        assert!(
+            ident_ok(&folder, Some(seen), false),
+            "caches do not compare times"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_folder_that_stays_keeps_its_name() {
+        let (_dir, guard, roots, root) = setup("clean-rename");
+        let cache = root.join("com.example");
+        std::fs::create_dir_all(&cache).unwrap();
+        // The deleter never removes NTUSER files, so the folder cannot go as a whole.
+        std::fs::write(cache.join("NTUSER.DAT"), b"x").unwrap();
+        std::fs::write(cache.join("other"), b"x").unwrap();
+        delete_item(
+            &entry_item(&root, "com.example"),
+            &guard,
+            &roots,
+            &AtomicBool::new(false),
+            &Progress::default(),
+        );
+        assert!(
+            cache.join("NTUSER.DAT").exists(),
+            "the folder has its own name back"
+        );
+        assert!(!cache.join("other").exists());
+        let renamed = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".cleaner-"));
+        assert!(!renamed);
     }
 
     #[test]
@@ -906,6 +1223,7 @@ mod tests {
                     .collect(),
                 &[],
                 &mut outcomes,
+                &on_disk,
             );
             assert_eq!(kept.iter().map(|j| j.index).collect::<Vec<_>>(), [0, 2]);
             outcomes.push((
@@ -961,10 +1279,11 @@ mod tests {
                 group: 1,
                 path: j.item.paths[0].clone(),
                 modified: j.item.modified,
+                ident: NOT_CHECKED,
             })
             .collect();
         let mut outcomes = Vec::new();
-        let (kept, _) = normalize(jobs, &files, &mut outcomes);
+        let (kept, _) = normalize(jobs, &files, &mut outcomes, &|_| true);
         let names: Vec<_> = kept.iter().map(|j| j.item.name.clone()).collect();
         assert_eq!(names, ["a", "c"], "the oldest copy (b) stays");
     }
@@ -985,17 +1304,25 @@ mod tests {
             group: 1,
             path: PathBuf::from(path),
             modified,
+            ident: NOT_CHECKED,
         };
-        // Returns the jobs that run, and the skipped jobs with their reason.
-        let run = |jobs: Vec<Job>, files: &[GroupFile]| {
+        // Returns the jobs that run, and the skipped jobs with their reason. `on_disk`
+        // says which copies are still on disk as the search saw them.
+        let run = |jobs: Vec<Job>, files: &[GroupFile], on_disk: &dyn Fn(&GroupFile) -> bool| {
             let mut outcomes = Vec::new();
-            let (left, _) = normalize(jobs, files, &mut outcomes);
+            let (left, _) = normalize(jobs, files, &mut outcomes, on_disk);
+            assert!(
+                outcomes.iter().all(|(_, o)| o.kept),
+                "refusals are marked, so the app unselects them"
+            );
             let skipped: Vec<(usize, String)> = outcomes
                 .iter()
                 .map(|(i, o)| (*i, o.skipped[0].1.clone()))
                 .collect();
             (left.iter().map(|j| j.index).collect::<Vec<_>>(), skipped)
         };
+        let all = |_: &GroupFile| true;
+        let kept = |i: usize| (i, "kept as the last copy".to_owned());
 
         // The oldest copy is selected as an installer, the other one as a duplicate.
         let files = [
@@ -1006,10 +1333,7 @@ mod tests {
             job(0, "/h/Downloads/a.dmg", Category::Installers),
             job(1, "/h/Documents/a.dmg", Category::Duplicates),
         ];
-        assert_eq!(
-            run(jobs, &files),
-            (vec![1], vec![(0, "kept as the last copy".to_owned())])
-        );
+        assert_eq!(run(jobs, &files, &all), (vec![1], vec![kept(0)]));
 
         // A selected Downloads folder holds the oldest copy: the other copy stays, so
         // the folder can still go.
@@ -1021,10 +1345,7 @@ mod tests {
             job(0, "/h/Downloads/old", Category::OldDownloads),
             job(1, "/h/Documents/a.bin", Category::Duplicates),
         ];
-        assert_eq!(
-            run(jobs, &files),
-            (vec![0], vec![(1, "kept as the last copy".to_owned())])
-        );
+        assert_eq!(run(jobs, &files, &all), (vec![0], vec![kept(1)]));
 
         // The folder holds every copy, so the folder stays.
         let files = [
@@ -1033,20 +1354,51 @@ mod tests {
         ];
         let jobs = vec![job(0, "/h/Downloads/old", Category::OldDownloads)];
         assert_eq!(
-            run(jobs, &files),
+            run(jobs, &files, &all),
             (
                 vec![],
                 vec![(0, "holds the last copy of a duplicate".to_owned())]
             )
         );
 
-        // A copy that nothing selects stays anyway: every job runs.
+        // A copy that nothing selects stays, if it is still on disk as the search saw it
+        // (checked for real here): every job runs. This is also a copy put back from the
+        // Trash after an earlier clean.
+        let dir = tempdir("clean-unselected-copy");
+        let unselected = dir.join("a.dmg");
+        std::fs::write(&unselected, b"x").unwrap();
         let files = [
-            file("/h/Downloads/a.dmg", 10),
+            GroupFile {
+                group: 1,
+                path: unselected.clone(),
+                modified: 10,
+                ident: ident_of(&unselected),
+            },
             file("/h/Documents/a.dmg", 20),
         ];
         let jobs = vec![job(1, "/h/Documents/a.dmg", Category::Duplicates)];
-        assert_eq!(run(jobs, &files), (vec![1], vec![]));
+        assert_eq!(run(jobs, &files, &on_disk), (vec![1], vec![]));
+
+        // The same copy, deleted or edited after the search: the selected copy stays.
+        let gone = |f: &GroupFile| f.path != unselected;
+        let jobs = vec![job(1, "/h/Documents/a.dmg", Category::Duplicates)];
+        assert_eq!(run(jobs, &files, &gone), (vec![], vec![kept(1)]));
+
+        // An earlier clean moved the other copy to the Trash: the last one stays.
+        let files = [file("/h/Documents/a.bin", 10), file("/h/Desktop/a.bin", 20)];
+        let trashed = |f: &GroupFile| f.path != Path::new("/h/Desktop/a.bin");
+        let jobs = vec![job(0, "/h/Documents/a.bin", Category::LargeFiles)];
+        assert_eq!(run(jobs, &files, &trashed), (vec![], vec![kept(0)]));
+
+        // Both copies are selected, but the oldest is already gone: the other one stays,
+        // because keeping a copy that is not there keeps nothing.
+        let files = [file("/h/old/a.bin", 10), file("/h/new/a.bin", 20)];
+        let jobs = vec![
+            job(0, "/h/old/a.bin", Category::Duplicates),
+            job(1, "/h/new/a.bin", Category::Duplicates),
+        ];
+        let old_gone = |f: &GroupFile| f.path != Path::new("/h/old/a.bin");
+        assert_eq!(run(jobs, &files, &old_gone), (vec![0], vec![kept(1)]));
     }
 
     #[test]

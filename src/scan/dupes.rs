@@ -95,10 +95,16 @@ pub fn find(
     let mut groups: Vec<Vec<Cand>> = by_len
         .into_values()
         .filter_map(|mut g| {
-            // 2. Hard links to one file are the same file, not copies.
+            // 2. Hard links to one file are the same file, not copies. Windows listings
+            // carry no file id, so read it now, for the few files that share a length.
             g.sort_by(|a, b| a.path.cmp(&b.path));
             let mut seen = HashSet::new();
-            g.retain(|c| c.ino == 0 || seen.insert(c.ino));
+            g.retain_mut(|c| {
+                if c.ino == 0 {
+                    c.ino = platform::file_index(&c.path).unwrap_or(0);
+                }
+                c.ino == 0 || seen.insert(c.ino)
+            });
             (g.len() > 1).then_some(g)
         })
         .collect();
@@ -380,7 +386,6 @@ mod tests {
         let mut b = a.clone();
         let mid = b.len() / 2;
         b[mid] ^= 1; // same size, same edges, different middle
-        #[allow(unused_mut)]
         let mut cands = vec![
             write_old(&dir.join("a1"), &a),
             write_old(&dir.join("a2"), &a),
@@ -388,11 +393,9 @@ mod tests {
             write_old(&dir.join("small1"), &[1u8; 1000]),
             write_old(&dir.join("small2"), &[1u8; 1000]),
         ];
-        #[cfg(unix)]
-        {
-            std::fs::hard_link(dir.join("a1"), dir.join("a1-link")).unwrap();
-            cands.push(cand(&dir.join("a1-link")));
-        }
+        // On Windows the candidate has no file id; the search reads it.
+        std::fs::hard_link(dir.join("a1"), dir.join("a1-link")).unwrap();
+        cands.push(cand(&dir.join("a1-link")));
         assert_eq!(run(cands), [["a1", "a2"]], "a hard link is not a copy");
     }
 

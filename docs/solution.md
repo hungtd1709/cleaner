@@ -14,7 +14,7 @@ Cleaner is one native Rust program with an egui user interface. A UI thread draw
 | Windows folder listing | std `read_dir` | It already returns size and attributes without opening files. |
 | Duplicate hash | xxh3-128 from `xxhash-rust`, then a byte-by-byte check | The hash finds matches fast; the byte check makes a wrong match impossible. |
 | Duplicate scope | Only the user's own files | Tool folders, environments and Git projects hold identical files that each tool needs, such as two copies of a Rust toolchain. |
-| Settings | A `key=value` text file, no new crate | Large-file limit, sort order and the Never touch list survive a restart. |
+| Settings | A `key=value` text file, no new crate | Large-file limit, sort order and the Never touch list survive a restart. A background thread replaces the file in one step, so a slow disk cannot freeze the window. |
 | Space map | Two levels from the scan; deeper folders measured on demand | The scan already walks home, so the map costs almost nothing until the user opens a folder. |
 | Build tool | `cargo xtask`, a Rust program in the repo | The same command works on both systems, with no shell scripts and no Node. |
 | Windows icon | `build.rs` writes a `.res` file and the linker embeds it | `link.exe` and `lld-link` both accept `.res` input, so no `rc.exe` or `llvm-rc` is needed. |
@@ -63,6 +63,8 @@ Cleaner is one native Rust program with an egui user interface. A UI thread draw
   - an action;
   - a minimum age;
   - the id of the app that owns it.
+
+  A root is used only if no folder on its path is a link (rule S4). A link could lead to another disk, a sync folder, or a folder that is not a cache. In `~/Library/Caches`, only a child named like a bundle id starts selected.
 - **No double counting.** A path that is the root of one target is skipped by broader targets. The selection is normalised before cleaning: a path inside another selected path is dropped.
 - **Walker.** One folder is one job on a shared stack. The pool is halved in Low Power Mode or battery saver.
   - macOS: as many workers as efficiency cores, from 2 to 6.
@@ -85,12 +87,12 @@ Cleaner is one native Rust program with an egui user interface. A UI thread draw
   - Space map: sizes of folders one and two levels below home.
 
   The pass skips `Library`, `AppData`, sync folders, the insides of bundles, the deny list, the Never touch list and roots that other targets own. It walks `.git` folders only to measure them.
-- **Scope flags.** While walking, each folder carries four flags: hidden, Git work tree, environment and tool install. A `pyvenv.cfg` file or a name in `rules::ENV_DIRS` marks an environment; `rules::TOOL_ROOTS` lists tool installs. Large files and build folders need none of hidden, environment or tool. Duplicate candidates also need no Git work tree.
+- **Scope flags.** While walking, each folder carries four flags: hidden, Git work tree, environment and tool install. A `pyvenv.cfg` file, a `conda-meta` folder or a name in `rules::ENV_DIRS` marks an environment; `rules::TOOL_ROOTS` lists tool installs. On macOS, a folder counts as a bundle if its extension is in `rules::BUNDLE_EXTS` or the system calls it a package; each extension is asked once per scan. Large files and build folders need none of hidden, environment or tool. Duplicate candidates also need no Git work tree.
 - **Full root sizes.** The junk pass also adds up every file under each cleaning root, whatever the age filter counts. The Space map adds these to the folders that hold the roots, so nothing is walked twice.
 - **In use.** An app is in use if its bundle id, name or executable matches a running app. Browser and app-data caches also count as in use if a file in them changed in the last 15 minutes.
 - **Duplicates on request.** Each stage keeps only files that still match:
   1. Group by data length. Drop files whose length or modification time changed since the scan.
-  2. Drop entries that are the same file.
+  2. Drop entries that are the same file. Windows listings carry no file id, so the search reads it here, for files that share a length.
   3. Hash the first and last 64 KB. Skip files whose first and last 64 KB are all zeros: preallocated images are not copies.
   4. Hash the rest in growing chunks (1, 4, 16, then 64 MB), regrouping after each chunk.
   5. Drop APFS clones, which share their disk blocks.
@@ -106,19 +108,20 @@ Cleaner is one native Rust program with an egui user interface. A UI thread draw
 ## 4. Clean engine
 
 1. **Prepare.** Normalise the selection, then check rule S3 for each item. Skip any item that changed since the scan.
-   - One copy of each duplicate group stays, even if another category selected the others (rule S10).
+   - One copy of each duplicate group stays, even if another category selected the others (rule S10). A copy counts only if it is unchanged on disk.
+   - A build folder must still sit next to its `package.json`, or still hold its `CACHEDIR.TAG`.
    - A folder that holds a Never touch item does not go to the Trash (rule S12).
 2. **Delete** caches, logs, temp files and build folders. The app removes the whole tree, keeps going past failures, and never follows links.
    - On a permission error it makes the parent writable or clears the read-only flag, then retries once.
-   - On Windows it first renames a folder in place. If the rename fails, a file inside is open, so the folder is skipped.
+   - On Windows it first renames a folder in place. If the rename fails, a file inside is open, so the folder is skipped. If some files stay, the folder gets its name back.
    - Windows paths use the `\\?\` form, so Win32 rules cannot change file names.
-3. **Move to Trash** user files, one item at a time. The report keeps each item's original path and, on macOS, its path in the Trash.
+3. **Empty Trash** before any move into it, so a clean never deletes what it just moved there.
+   - macOS: deletes the contents of `~/.Trash` if the app has Full Disk Access. Otherwise it asks Finder through `osascript`.
+   - Windows: calls `SHEmptyRecycleBinW`.
+4. **Move to Trash** user files, one item at a time. The report keeps each item's original path and, on macOS, its path in the Trash.
    - macOS: `NSFileManager.trashItemAtURL`.
    - Windows: `trash::delete`. It skips names that end in a dot or space, and reserved names such as `CON`, because the shell would change them.
    - A refusal is reported, never retried as a delete.
-4. **Empty Trash.**
-   - macOS: deletes the contents of `~/.Trash` if the app has Full Disk Access. Otherwise it asks Finder through `osascript`.
-   - Windows: calls `SHEmptyRecycleBinW`.
 5. **Report.** Show bytes removed, the measured change in free space and skipped items. Refresh the disk bar and drop cleaned rows.
 6. **Put back** (on request). An item is skipped if something else now has its name.
    - macOS: renames each item from the Trash back to its original path. If macOS refuses, Finder moves it.
@@ -131,10 +134,10 @@ Cleaner is one native Rust program with an egui user interface. A UI thread draw
 | Disk space | `statfs` | `GetDiskFreeSpaceExW` |
 | Move to Trash | `NSFileManager.trashItemAtURL` | `trash` crate: `IFileOperation` with `FOF_NO_UI`, `FOF_ALLOWUNDO`, `FOF_WANTNUKEWARNING` |
 | Trash size / empty | read `~/.Trash` / delete it, or ask Finder | `SHQueryRecycleBinW` / `SHEmptyRecycleBinW` |
-| Reveal | `open -R <path>` | `explorer /select,<path>` |
+| Reveal | `open -R <path>` | `explorer /select,<path>`, with the full path of `explorer.exe` |
 | Running apps | `NSWorkspace.runningApplications`: bundle id, name, executable | Toolhelp process snapshot |
 | Put back | `rename`, or Finder through `osascript` | `trash::os_limited::restore_all` |
-| Preview | `qlmanage -p` | `ShellExecuteW` "open" |
+| Preview | `qlmanage -p` | `ShellExecuteW` "open"; File Explorer for programs and scripts |
 | Settings folder | `~/Library/Application Support/io.github.hungtd1709.cleaner` | `%APPDATA%\Cleaner` |
 | Folders | `~/…`, `$TMPDIR` | env vars; `SHGetKnownFolderPath(Downloads)`; OneDrive env vars; `SyncRootManager` registry key |
 | Worker energy | `pthread_set_qos_class_self_np(UTILITY)`; `NSProcessInfo` activity | `SetThreadInformation(ThreadPowerThrottling)` |
@@ -244,6 +247,7 @@ Measured on the reference Mac: Apple silicon, macOS 27.0.1. Version 1.1 numbers 
 | TCC | Transparency, Consent and Control: macOS privacy protection for some folders |
 | Full Disk Access | A macOS setting that lifts TCC limits for one app |
 | App Nap | macOS slowing down apps whose windows are hidden |
+| Bundle id | The reverse-domain name that identifies a macOS app, such as `com.spotify.client` |
 | Electron app | A desktop app built on Chromium; it keeps caches such as `Code Cache` and `GPUCache` |
 | QoS / EcoQoS | macOS / Windows hint that a thread may run slower to save energy |
 | `getattrlistbulk` | macOS call that lists a folder together with each entry's details |

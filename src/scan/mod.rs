@@ -2,12 +2,12 @@
 
 pub mod dupes;
 #[cfg(target_os = "macos")]
-mod list_macos;
+pub(crate) mod list_macos;
 pub mod walk;
 pub mod zip;
 
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering::Relaxed};
@@ -182,6 +182,9 @@ pub struct MapEntry {
     pub size: u64,
     pub files: u64,
     pub children: Vec<MapEntry>,
+    /// The home pass walked this folder, so `children` lists its folders. A cleaning root
+    /// that the pass skipped, such as `~/.cache`, has only its total.
+    pub walked: bool,
 }
 
 pub struct Output {
@@ -193,6 +196,9 @@ pub struct Output {
     pub map: Vec<MapEntry>,
     /// Bytes in files that sit directly in the home folder.
     pub home_files: u64,
+    /// The folders the scan used: home, Downloads and the sync folders that no walk enters
+    /// (rule S6). `None` if the home folder was not found.
+    pub env: Option<Env>,
 }
 
 pub struct Handle {
@@ -263,6 +269,7 @@ fn run(input: &Input, progress: &Progress, cancel: &AtomicBool, send: &dyn Fn(Ms
             notes: vec!["Cleaner could not find your home folder.".to_owned()],
             map: Vec::new(),
             home_files: 0,
+            env: None,
         })));
         return;
     };
@@ -421,6 +428,7 @@ fn run(input: &Input, progress: &Progress, cancel: &AtomicBool, send: &dyn Fn(Ms
         notes,
         map,
         home_files,
+        env: Some(env.clone()),
     })));
 }
 
@@ -521,6 +529,9 @@ fn add_target(t: &Target, claimed: &HashSet<PathBuf>, guard: &Guard, now: i64, j
                 let mut item =
                     item_for(name.clone(), vec![path.clone()], root.clone(), Shape::Entry);
                 item.group = t.name.clone();
+                if t.apps_only && !rules::is_bundle_id(&name) {
+                    item.selected = false;
+                }
                 if t.app_id.is_none() && cfg!(target_os = "macos") {
                     item.app_id = Some(name);
                 }
@@ -679,6 +690,8 @@ struct Home<'a> {
     cands: Mutex<Vec<dupes::Cand>>,
     map: Mutex<Vec<MapNode>>,
     home_files: AtomicU64,
+    /// Whether macOS treats a folder extension as a package, asked once per extension.
+    packages: Mutex<HashMap<OsString, bool>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -687,6 +700,29 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn dot_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().first() == Some(&b'.')
+}
+
+/// The file id the listings report: the inode number on macOS, 0 on Windows.
+fn file_id(md: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::ino(md)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        0
+    }
+}
+
+/// Rule S3 for a build folder: a reason the scan listed it still holds. It has a
+/// `CACHEDIR.TAG`, or it is a `node_modules` next to a `package.json`.
+pub fn still_build_folder(path: &Path) -> bool {
+    cachedir_tag(path)
+        || (path.file_name() == Some(OsStr::new("node_modules"))
+            && path
+                .parent()
+                .is_some_and(|p| p.join("package.json").is_file()))
 }
 
 /// True if `dir/CACHEDIR.TAG` starts with the standard signature.
@@ -731,7 +767,28 @@ impl<'a> Home<'a> {
             cands: Mutex::new(Vec::new()),
             map: Mutex::new(Vec::new()),
             home_files: AtomicU64::new(0),
+            packages: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A folder that Finder shows as one file (macOS, rule S7). The fixed list answers most
+    /// names. For another extension, such as `.scriv`, the system decides; that takes about
+    /// 30 µs, so each extension is asked once. A folder marked as a bundle by a flag rather
+    /// than by its extension counts only if it is the first of its extension.
+    fn is_bundle(&self, name: &OsStr, path: &Path) -> bool {
+        if rules::ext_in(name, rules::BUNDLE_EXTS) {
+            return true;
+        }
+        let Some(ext) = Path::new(name).extension() else {
+            return false;
+        };
+        let ext = ext.to_ascii_lowercase();
+        if let Some(&known) = lock(&self.packages).get(&ext) {
+            return known;
+        }
+        let package = platform::is_package(path);
+        lock(&self.packages).insert(ext, package);
+        package
     }
 
     fn bucket(
@@ -781,10 +838,11 @@ impl<'a> Home<'a> {
             if entries.iter().any(|e| e.name == ".git") {
                 ctx.flags |= REPO;
             }
-            if entries
-                .iter()
-                .any(|e| e.kind == Kind::File && e.name == "pyvenv.cfg")
-            {
+            // A Python venv has `pyvenv.cfg`; a conda install or environment, `conda-meta`.
+            if entries.iter().any(|e| {
+                (e.kind == Kind::File && e.name == "pyvenv.cfg")
+                    || (e.kind == Kind::Dir && e.name == "conda-meta")
+            }) {
                 ctx.flags |= ENV;
             }
         }
@@ -802,7 +860,8 @@ impl<'a> Home<'a> {
                 .any(|e| e.kind == Kind::File && e.name == "CACHEDIR.TAG")
             && cachedir_tag(dir)
         {
-            let own = std::fs::symlink_metadata(dir).map_or(0, |m| mtime_of(&m));
+            let md = std::fs::symlink_metadata(dir).ok();
+            let own = md.as_ref().map_or(0, mtime_of);
             let project = match (dir.parent(), dir.file_name()) {
                 (Some(parent), Some(name)) => {
                     walk::list(parent).map_or(0, |e| project_time(&e, name))
@@ -810,7 +869,7 @@ impl<'a> Home<'a> {
                 _ => 0,
             };
             let ident = Ident {
-                ino: 0,
+                ino: md.as_ref().map_or(0, file_id),
                 len: 0,
                 mtime: own,
                 dir: true,
@@ -888,9 +947,7 @@ impl<'a> Home<'a> {
                             );
                         }
                         if child.unit == NONE && own_scope {
-                            if cfg!(target_os = "macos")
-                                && rules::ext_in(&e.name, rules::BUNDLE_EXTS)
-                            {
+                            if cfg!(target_os = "macos") && self.is_bundle(&e.name, &path) {
                                 child.unit = self.bucket(
                                     BucketKind::Bundle,
                                     path.clone(),
@@ -1050,6 +1107,7 @@ impl<'a> Home<'a> {
                     size: n.size,
                     files: n.files,
                     children: Vec::new(),
+                    walked: true,
                 });
             }
         }
@@ -1062,6 +1120,7 @@ impl<'a> Home<'a> {
                     size: n.size,
                     files: n.files,
                     children: Vec::new(),
+                    walked: true,
                 });
             }
         }
@@ -1236,7 +1295,8 @@ mod tests {
             |d, c, l, p| pass.visit(d, c, l, p),
         );
         let cands = std::mem::take(&mut *lock(&pass.cands));
-        let (map, _) = pass.take_map(&[]);
+        // A cleaning root, measured by the junk pass, that the home pass skips.
+        let (map, _) = pass.take_map(&[(home.join(".cache"), 4096)]);
         (cands, pass.into_items(fmt::now()), map)
     }
 
@@ -1253,10 +1313,21 @@ mod tests {
             "repo/data.bin",
             "go/pkg/z.bin",
             "Keep/k.bin",
+            // Tool installs: conda outside home's top level, Scoop's old app versions.
+            "opt/anaconda3/lib/libbig.dylib",
+            "scoop/apps/tool/1.0/a.dll",
         ] {
             let path = home.join(p);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, &big).unwrap();
+        }
+        fs::create_dir_all(home.join("opt/anaconda3/conda-meta")).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // A package type that the fixed list does not name: macOS says it is one.
+            let inner = home.join("Documents/Tool.scptd/Contents/c.bin");
+            fs::create_dir_all(inner.parent().unwrap()).unwrap();
+            fs::write(inner, &big).unwrap();
         }
         fs::write(home.join("env/pyvenv.cfg"), b"home = /usr/bin").unwrap();
         fs::create_dir_all(home.join("repo/.git")).unwrap();
@@ -1304,9 +1375,89 @@ mod tests {
         // The Space map still measures hidden folders, but never the Never touch list.
         assert!(
             map.iter()
-                .any(|e| e.path.ends_with(".rustup") && e.size >= big.len() as u64)
+                .any(|e| e.path.ends_with(".rustup") && e.size >= big.len() as u64 && e.walked)
         );
         assert!(!map.iter().any(|e| e.path.ends_with("Keep")));
+        let cache = map
+            .iter()
+            .find(|e| e.path.ends_with(".cache"))
+            .expect("the cleaning root");
+        assert!(
+            !cache.walked && cache.size == 4096,
+            "a cleaning root has only its total"
+        );
+    }
+
+    #[test]
+    fn only_app_named_caches_start_selected() {
+        let dir = crate::rules::tests::tempdir("app-caches");
+        let caches = dir.join("Caches");
+        for name in ["com.spotify.client", "gopls"] {
+            fs::create_dir_all(caches.join(name)).unwrap();
+            fs::write(caches.join(name).join("blob"), b"x").unwrap();
+        }
+        let env = Env {
+            home: dir.clone(),
+            temp: dir.join("tmp"),
+            downloads: dir.join("Downloads"),
+            local: dir.clone(),
+            cloud: Vec::new(),
+        };
+        let target = Target {
+            category: Category::SystemJunk,
+            name: "App cache".into(),
+            roots: vec![caches.clone()],
+            mode: Mode::Children,
+            filter: rules::Filter::NotApple,
+            min_age_days: 0,
+            app_id: None,
+            selected: true,
+            keep: Vec::new(),
+            note: "",
+            watch_recent: false,
+            apps_only: true,
+        };
+        let guard = Guard::new(&env, std::slice::from_ref(&target), &[]);
+        let mut junk = Junk {
+            items: Vec::new(),
+            jobs: Vec::new(),
+            roots: Vec::new(),
+            root_sizes: Vec::new(),
+        };
+        add_target(&target, &HashSet::new(), &guard, fmt::now(), &mut junk);
+        let mut picked: Vec<(String, bool)> = junk
+            .items
+            .iter()
+            .map(|it| (it.name.clone(), it.selected))
+            .collect();
+        picked.sort();
+        assert_eq!(
+            picked,
+            [
+                ("com.spotify.client".to_owned(), true),
+                ("gopls".to_owned(), false),
+            ],
+            "a tool's cache folder is listed, but starts unselected"
+        );
+    }
+
+    #[test]
+    fn a_build_folder_must_still_be_one() {
+        let dir = crate::rules::tests::tempdir("still-build");
+        let modules = dir.join("app/node_modules");
+        fs::create_dir_all(&modules).unwrap();
+        assert!(!still_build_folder(&modules), "no package.json");
+        fs::write(dir.join("app/package.json"), b"{}").unwrap();
+        assert!(still_build_folder(&modules));
+        let target = dir.join("app/target");
+        fs::create_dir_all(&target).unwrap();
+        assert!(!still_build_folder(&target), "no CACHEDIR.TAG");
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        assert!(still_build_folder(&target));
     }
 
     /// Find duplicates on this machine, read-only. Checks the scope rules and spot-checks

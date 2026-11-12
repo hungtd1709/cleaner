@@ -169,7 +169,7 @@ pub fn from_metadata(name: OsString, md: &Metadata) -> Entry {
 
 /// Windows FILETIME (100 ns since 1601) to seconds since 1970.
 #[cfg(windows)]
-fn filetime_secs(ft: u64) -> i64 {
+pub(crate) fn filetime_secs(ft: u64) -> i64 {
     (ft / 10_000_000) as i64 - 11_644_473_600
 }
 

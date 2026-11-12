@@ -15,9 +15,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_SEQUENTIAL_SCAN,
-    GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW,
-    INVALID_FILE_SIZE,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_SEQUENTIAL_SCAN, FindClose,
+    FindFirstFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDriveTypeW,
+    GetVolumeInformationW, INVALID_FILE_SIZE, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -33,9 +33,9 @@ use windows_sys::Win32::System::Threading::{
     THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE, ThreadPowerThrottling,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_Downloads, IsUserAnAdmin, KF_FLAG_DEFAULT, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI,
-    SHERB_NOSOUND, SHEmptyRecycleBinW, SHGetKnownFolderPath, SHQUERYRBINFO, SHQueryRecycleBinW,
-    ShellExecuteW,
+    FOLDERID_Downloads, FOLDERID_Windows, IsUserAnAdmin, KF_FLAG_DEFAULT, SHERB_NOCONFIRMATION,
+    SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW, SHGetKnownFolderPath, SHQUERYRBINFO,
+    SHQueryRecycleBinW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL,
@@ -61,13 +61,13 @@ pub fn init_process() {}
 
 pub fn env() -> Option<Env> {
     let home = rules::resolve_dir(&std::env::home_dir()?)?;
-    let temp = rules::resolve_dir(&std::env::temp_dir()).unwrap_or_default();
     let local = std::env::var_os("LOCALAPPDATA")
         .and_then(|p| rules::resolve_dir(Path::new(&p)))
         .unwrap_or_else(|| home.join(r"AppData\Local"));
     let downloads = known_downloads()
         .and_then(|p| rules::resolve_dir(&p))
         .unwrap_or_else(|| home.join("Downloads"));
+    let temp = temp_folder(&home, &local, &downloads).unwrap_or_default();
     let mut env = Env {
         home,
         temp,
@@ -79,18 +79,24 @@ pub fn env() -> Option<Env> {
     Some(env)
 }
 
+/// The folder of temporary files. With TMP and TEMP unset, Windows answers with the home
+/// folder, so an answer that does not look like a temp folder falls back to the default.
+fn temp_folder(home: &Path, local: &Path, downloads: &Path) -> Option<PathBuf> {
+    rules::resolve_dir(&std::env::temp_dir())
+        .filter(|t| rules::is_temp_folder(t, local, &[home, local, downloads]))
+        .or_else(|| rules::resolve_dir(&local.join("Temp")))
+}
+
 /// The Downloads folder; users can move it, so ask the shell.
 fn known_downloads() -> Option<PathBuf> {
+    known_folder(&FOLDERID_Downloads)
+}
+
+/// A folder that the shell knows by id.
+fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     let mut raw = null_mut();
     // SAFETY: valid GUID and out-pointer; the buffer is freed below.
-    let hr = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_Downloads,
-            KF_FLAG_DEFAULT as u32,
-            null_mut(),
-            &mut raw,
-        )
-    };
+    let hr = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, null_mut(), &mut raw) };
     let path = if hr >= 0 && !raw.is_null() {
         // SAFETY: the shell returns a NUL-terminated string.
         let len = unsafe { (0..).take_while(|&i| *raw.add(i) != 0).count() };
@@ -113,9 +119,7 @@ fn cloud_roots(env: &Env) -> Vec<PathBuf> {
         .filter_map(std::env::var_os)
         .map(PathBuf::from)
         .collect();
-    for name in ["iCloudDrive", "Dropbox", "Google Drive", "My Drive", "Box"] {
-        roots.push(env.home.join(name));
-    }
+    roots.extend(rules::home_sync_folders(&env.home));
     roots.extend(registry_sync_roots());
     let mut roots: Vec<PathBuf> = roots.iter().filter_map(|p| rules::resolve_dir(p)).collect();
     roots.sort();
@@ -255,8 +259,57 @@ pub fn system_disk() -> Option<Disk> {
 pub fn reveal(path: &Path) {
     let arg = format!("/select,\"{}\"", fmt::path(path));
     std::thread::spawn(move || {
-        let _ = Command::new("explorer.exe").raw_arg(arg).status();
+        // A full path: Windows looks for a bare name in this app's own folder first, which
+        // is often Downloads, where a planted `explorer.exe` could wait.
+        let Some(windows) = known_folder(&FOLDERID_Windows) else {
+            return;
+        };
+        let _ = Command::new(windows.join("explorer.exe"))
+            .raw_arg(arg)
+            .status();
     });
+}
+
+/// The file's id on its volume (the NTFS file index). Hard links to one file share it.
+/// Listings do not carry it and reading it costs an open, so only the duplicate search
+/// asks, for the few files that share a length.
+pub fn file_index(path: &Path) -> Option<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    // No access rights: reading the id needs none, and a file in use still opens.
+    let file = OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    // SAFETY: plain data, filled by the call.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid handle and out-pointer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    Some((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+}
+
+/// A folder's change time as its parent folder lists it, which is where the scan read it.
+/// NTFS may update that copy later than the one read through a handle.
+pub fn listed_mtime(path: &Path) -> Option<i64> {
+    let name = wide(path);
+    let mut data = WIN32_FIND_DATAW::default();
+    // SAFETY: valid NUL-terminated path and out-pointer; the handle is closed below.
+    let find = unsafe { FindFirstFileW(name.as_ptr(), &mut data) };
+    if find == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: the handle came from FindFirstFileW.
+    unsafe { FindClose(find) };
+    let t = data.ftLastWriteTime;
+    Some(crate::scan::walk::filetime_secs(
+        (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime),
+    ))
 }
 
 /// Lower-case `.exe` names of running processes.
@@ -438,8 +491,12 @@ pub fn restore_from_trash(
         .collect()
 }
 
-/// Opens the file with its default app, as a preview.
+/// Opens the file with its default app, as a preview. Opening a program, installer or
+/// script would run it, so for those File Explorer only shows the file.
 pub fn preview(path: &Path) {
+    if runs_when_opened(path) {
+        return reveal(path);
+    }
     let file = wide(fmt::path(path));
     let verb = wide("open");
     // SAFETY: valid NUL-terminated strings; no parent window.
@@ -453,6 +510,64 @@ pub fn preview(path: &Path) {
             SW_SHOWNORMAL,
         );
     }
+}
+
+/// File types that Windows runs, installs or imports when they are opened.
+fn runs_when_opened(path: &Path) -> bool {
+    const RUNNABLE: &[&str] = &[
+        "appinstaller",
+        "application",
+        "appref-ms",
+        "appx",
+        "appxbundle",
+        "bat",
+        "cmd",
+        "com",
+        "cpl",
+        "exe",
+        "gadget",
+        "hta",
+        "inf",
+        "jar",
+        "js",
+        "jse",
+        "library-ms",
+        "lnk",
+        "msc",
+        "msi",
+        "msix",
+        "msixbundle",
+        "msp",
+        "pif",
+        "ps1",
+        "reg",
+        "scf",
+        "scr",
+        "settingcontent-ms",
+        "url",
+        "vb",
+        "vbe",
+        "vbs",
+        "website",
+        "ws",
+        "wsc",
+        "wsf",
+        "wsh",
+    ];
+    let Some(ext) = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    // PATHEXT names what the command line runs, including types that tools added.
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    RUNNABLE.contains(&ext.as_str())
+        || pathext
+            .split(';')
+            .any(|p| p.strip_prefix('.') == Some(ext.as_str()))
 }
 
 /// Where settings live: `%APPDATA%\Cleaner`.
@@ -541,6 +656,17 @@ pub fn clone_id(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Windows keeps no "date added". The scan and the deleter both use the creation time,
+/// so their age limits agree.
+pub fn added_time(_path: &Path) -> Option<i64> {
+    None
+}
+
+/// Windows has no packages: a folder is always a folder.
+pub fn is_package(_path: &Path) -> bool {
+    false
+}
+
 pub fn open_for_hash(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -582,6 +708,31 @@ pub fn make_removable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_time_reads_as_the_scan_listed_it() {
+        let dir = crate::rules::tests::tempdir("listed-time");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/f"), b"x").unwrap();
+        let listed = crate::scan::walk::list(&dir).unwrap();
+        let sub = listed.iter().find(|e| e.name == "sub").unwrap();
+        assert_eq!(listed_mtime(&dir.join("sub")), Some(sub.mtime));
+    }
+
+    #[test]
+    fn preview_never_runs_programs() {
+        for runnable in [
+            r"C:\d\Setup.EXE",
+            r"C:\d\app.msi",
+            r"C:\d\fix.ps1",
+            r"C:\d\a.lnk",
+        ] {
+            assert!(runs_when_opened(Path::new(runnable)), "{runnable}");
+        }
+        for document in [r"C:\d\photo.jpg", r"C:\d\notes.txt", r"C:\d\folder"] {
+            assert!(!runs_when_opened(Path::new(document)), "{document}");
+        }
+    }
 
     #[test]
     fn flags_names_the_shell_would_change() {

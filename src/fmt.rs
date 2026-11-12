@@ -25,7 +25,8 @@ pub fn bytes(n: u64) -> String {
     }
     let mut value = n as f64 / step;
     let mut unit = 0;
-    while value >= step && unit < UNITS.len() - 1 {
+    // Step up once rounding would show a full step, so 999.96 KB reads "1.0 MB".
+    while value.round() >= step && unit < UNITS.len() - 1 {
         value /= step;
         unit += 1;
     }
@@ -101,6 +102,8 @@ mod tests {
         assert_eq!(bytes(STEP), "1.0 KB");
         assert_eq!(bytes(3 * GB / 2), "1.5 GB");
         assert_eq!(bytes(250 * MB), "250 MB");
+        assert_eq!(bytes(MB - 1), "1.0 MB", "not 1000 KB");
+        assert_eq!(bytes(GB - 1), "1.0 GB");
     }
 
     #[test]

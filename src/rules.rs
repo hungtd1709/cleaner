@@ -82,7 +82,7 @@ impl Category {
     pub fn about(self) -> &'static str {
         match self {
             Category::SystemJunk => {
-                "App caches, old logs and old temporary files. Apps re-create them when they need them."
+                "App caches, old logs and old temporary files. Apps re-create them when they need them. A cache folder not named after an app starts unselected: it may hold a tool's downloads."
             }
             Category::OptionalCaches => {
                 if cfg!(windows) {
@@ -197,6 +197,9 @@ pub struct Target {
     pub note: &'static str,
     /// The item counts as in use if a file in it changed in the last few minutes.
     pub watch_recent: bool,
+    /// Only children named like an app's bundle id, such as `com.spotify.client`, start
+    /// selected. Developer tools keep costly downloads under plain names, such as `gopls`.
+    pub apps_only: bool,
 }
 
 /// Folders the rules are built from. All paths are absolute and fully resolved.
@@ -218,6 +221,75 @@ pub fn resolve_dir(path: &Path) -> Option<PathBuf> {
         return None;
     }
     std::fs::canonicalize(path).ok()
+}
+
+/// The Never touch list, plus each path in the form the scan lists paths: canonical, so
+/// `\\?\C:\…` on Windows and the on-disk letter case on macOS. A path typed into
+/// `settings.txt` by hand may differ. Call it off the UI thread: resolving a path on a
+/// network share can take long.
+pub fn canonical_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = paths.to_vec();
+    out.extend(paths.iter().filter_map(|p| std::fs::canonicalize(p).ok()));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Like `resolve_dir`, for a cleaning root: the path must also be its own resolved form,
+/// so no folder on the way is a link (rule S4). A link could lead to another disk, a sync
+/// folder, or a folder that is not a cache. Letter case may differ.
+fn resolve_root(path: &Path) -> Option<PathBuf> {
+    let real = resolve_dir(path)?;
+    real.as_os_str()
+        .eq_ignore_ascii_case(path.as_os_str())
+        .then_some(real)
+}
+
+/// True if `dir` can be the folder of temporary files: `Temp` in `local` or a folder in it
+/// (`Temp\2` in a remote session), or any folder named `Temp` or `Tmp`. It must hold none
+/// of `keep`. With TMP and TEMP unset, Windows names the home folder, whose children are
+/// not junk.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_temp_folder(dir: &Path, local: &Path, keep: &[&Path]) -> bool {
+    let named = dir
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("temp") || n.eq_ignore_ascii_case("tmp"));
+    let in_local_temp = dir
+        .strip_prefix(local)
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .is_some_and(|c| c.as_os_str().eq_ignore_ascii_case("temp"));
+    (named || in_local_temp) && !keep.iter().any(|k| k.starts_with(dir))
+}
+
+/// Sync folders that cloud apps keep directly in the home folder.
+const HOME_SYNC_DIRS: &[&str] = &[
+    "Box",
+    "Box Sync",
+    "Dropbox",
+    "Google Drive",
+    "iCloudDrive",
+    "My Drive",
+    "OneDrive",
+];
+
+/// The sync folders directly in `home`, team folders such as `Dropbox (Acme)` included.
+/// Only real folders count: the walks never follow links anyway.
+pub fn home_sync_folders(home: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = HOME_SYNC_DIRS
+        .iter()
+        .filter_map(|name| resolve_dir(&home.join(name)))
+        .collect();
+    if let Ok(read) = std::fs::read_dir(home) {
+        for entry in read.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("Dropbox (") {
+                found.extend(resolve_dir(&entry.path()));
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Expands a pattern such as `Google/Chrome/User Data/*/Cache` below `base`.
@@ -262,7 +334,7 @@ impl Builder {
         selected: bool,
         app: Option<&str>,
     ) -> Option<&mut Target> {
-        let mut roots: Vec<PathBuf> = roots.iter().filter_map(|r| resolve_dir(r)).collect();
+        let mut roots: Vec<PathBuf> = roots.iter().filter_map(|r| resolve_root(r)).collect();
         roots.sort();
         roots.dedup();
         if roots.is_empty() {
@@ -281,6 +353,7 @@ impl Builder {
             note: "",
             // A browser or app cache written to a moment ago belongs to an open app.
             watch_recent: matches!(category, Category::Browsers | Category::AppData),
+            apps_only: false,
         });
         self.targets.last_mut()
     }
@@ -293,10 +366,8 @@ impl Builder {
         filter: Filter,
         min_age_days: u32,
         selected: bool,
-    ) {
-        let Some(root) = resolve_dir(&root) else {
-            return;
-        };
+    ) -> Option<&mut Target> {
+        let root = resolve_root(&root)?;
         self.targets.push(Target {
             category,
             name: name.to_owned(),
@@ -309,7 +380,9 @@ impl Builder {
             keep: Vec::new(),
             note: "",
             watch_recent: false,
+            apps_only: false,
         });
+        self.targets.last_mut()
     }
 
     /// Old versions in `root`: every child except the newest and those in `keep`.
@@ -321,7 +394,7 @@ impl Builder {
         keep: Vec<PathBuf>,
         app: Option<&str>,
     ) {
-        let Some(root) = resolve_dir(&root) else {
+        let Some(root) = resolve_root(&root) else {
             return;
         };
         let Ok(read) = std::fs::read_dir(&root) else {
@@ -360,6 +433,7 @@ impl Builder {
             keep,
             note: "",
             watch_recent: false,
+            apps_only: false,
         });
     }
 
@@ -490,14 +564,16 @@ fn os_targets(b: &mut Builder, env: &Env) {
         roots
     };
 
-    b.children(
+    if let Some(t) = b.children(
         SystemJunk,
         "App cache",
         caches.clone(),
         Filter::NotApple,
         0,
         true,
-    );
+    ) {
+        t.apps_only = true;
+    }
     b.children(SystemJunk, "Logs", lib.join("Logs"), Filter::Any, 7, true);
     b.children(
         SystemJunk,
@@ -697,6 +773,47 @@ fn os_targets(b: &mut Builder, env: &Env) {
         0,
         false,
     );
+    // Tool folders in ~/Library/Caches that cost time or downloads to rebuild. As their own
+    // roots they leave the "App cache" list, which starts selected. What is not a cache in
+    // them stays (see the Guard).
+    if let Some(t) = b.whole(
+        DevCaches,
+        "Deno cache",
+        vec![caches.join("deno")],
+        false,
+        None,
+    ) {
+        t.note = "Local storage and KV databases stay.";
+    }
+    let mut ides = vec![caches.join("JetBrains")];
+    ides.extend(glob(&caches, "Google/*").into_iter().filter(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("AndroidStudio"))
+    }));
+    if let Some(t) = b.whole(DevCaches, "JetBrains IDE caches", ides, false, None) {
+        t.note = "Quit the IDE first; it rebuilds its indexes. Local History stays.";
+    }
+    if let Some(t) = b.whole(
+        DevCaches,
+        "Poetry cache",
+        vec![caches.join("pypoetry")],
+        false,
+        None,
+    ) {
+        t.note = "Also removes Poetry's virtual environments; `poetry install` makes them again.";
+    }
+    for (name, dir) in [
+        ("Playwright browsers", "ms-playwright"),
+        ("Cypress app", "Cypress"),
+        ("Electron downloads", "electron"),
+        ("electron-builder cache", "electron-builder"),
+        ("node-gyp headers", "node-gyp"),
+        ("Swift packages", "org.swift.swiftpm"),
+        ("Windows SDK for cargo-xwin", "cargo-xwin"),
+        ("ccache", "ccache"),
+    ] {
+        b.whole(DevCaches, name, vec![caches.join(dir)], false, None);
+    }
 
     b.children(
         XcodeArchives,
@@ -929,6 +1046,7 @@ fn os_targets(b: &mut Builder, env: &Env) {
         keep: Vec::new(),
         note: "",
         watch_recent: false,
+        apps_only: false,
     });
 }
 
@@ -1018,6 +1136,7 @@ pub const CACHE_DENY: &[&str] = &[
 
 /// Folder extensions that Finder shows as one file (bundles). We never select files inside them.
 pub const BUNDLE_EXTS: &[&str] = &[
+    "aplibrary",
     "app",
     "appex",
     "bundle",
@@ -1028,10 +1147,13 @@ pub const BUNDLE_EXTS: &[&str] = &[
     "kext",
     "key",
     "logicx",
+    "lrlibrary",
     "band",
+    "migratedphotolibrary",
     "musiclibrary",
     "numbers",
     "pages",
+    "photolibrary",
     "photoslibrary",
     "playground",
     "plugin",
@@ -1049,10 +1171,14 @@ pub const BUNDLE_EXTS: &[&str] = &[
 /// Shown so the user knows about them, but never selectable: disk images of virtual
 /// machines, media libraries and mail archives.
 pub const INFO_ONLY_EXTS: &[&str] = &[
+    "aplibrary",
     "fcpbundle",
     "imovielibrary",
+    "lrlibrary",
+    "migratedphotolibrary",
     "musiclibrary",
     "ost",
+    "photolibrary",
     "photoslibrary",
     "pst",
     "pvm",
@@ -1091,12 +1217,15 @@ pub const ENV_DIRS: &[&str] = &[
 /// Tool installs directly inside the home folder. Their files are not the user's own files.
 pub const TOOL_ROOTS: &[&str] = &[
     "go",
+    "sdk",
     "miniconda3",
     "anaconda3",
     "miniforge3",
     "mambaforge",
+    "micromamba",
     "flutter",
     "fvm",
+    "scoop",
 ];
 
 /// Folders inside an Electron app's data folder that are caches.
@@ -1153,6 +1282,21 @@ pub fn is_setup_exe(name: &OsStr) -> bool {
     name.ends_with(".exe") && (name.contains("setup") || name.contains("install"))
 }
 
+/// True for a name shaped like an app's bundle id, such as `com.spotify.client`: three or
+/// more parts made of letters, digits, `-` and `_`, the first a short lower-case domain
+/// such as `com` or `io`.
+pub fn is_bundle_id(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    parts.len() >= 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        && parts[0].len() <= 6
+        && parts[0].chars().all(|c| c.is_ascii_lowercase())
+}
+
 pub fn ext_in(name: &OsStr, list: &[&str]) -> bool {
     Path::new(name)
         .extension()
@@ -1173,6 +1317,9 @@ pub struct Guard {
     /// Nothing inside is removed, unless the item's own root is inside it too
     /// (for example a browser's `Code Cache` inside `Application Support`).
     soft: Vec<PathBuf>,
+    /// Claude Code's `projects` folder, as written and as resolved. Nothing inside a
+    /// project's `memory` folder is ever removed (see `in_claude_memory`).
+    claude_projects: Vec<PathBuf>,
 }
 
 impl Guard {
@@ -1240,6 +1387,12 @@ impl Guard {
                 h.join(".cargo/credentials.toml"),
                 h.join(".gradle/gradle.properties"),
             ];
+            // Data that tools keep inside their cache folders: Deno's local storage and
+            // KV databases, and the IDEs' Local History of file changes.
+            let caches = lib.join("Caches");
+            g.hard.push(caches.join("deno").join("location_data"));
+            g.hard.extend(glob(&caches, "JetBrains/*/LocalHistory"));
+            g.hard.extend(glob(&caches, "Google/*/LocalHistory"));
             g.soft = [
                 "Application Support",
                 "Containers",
@@ -1293,9 +1446,28 @@ impl Guard {
                 h.join(r".cargo\credentials"),
                 h.join(r".cargo\credentials.toml"),
                 h.join(r".gradle\gradle.properties"),
+                // Deno's local storage and KV databases, inside the "Deno cache" target.
+                env.local.join(r"deno\location_data"),
             ];
         }
-        g.hard.extend(never.iter().cloned());
+        // Sync folders: nothing inside is walked or removed (rule S6).
+        g.hard.extend(env.cloud.iter().cloned());
+        // The Hugging Face login token sits inside a cache folder that cleaning may delete.
+        let hugging_face = h.join(".cache").join("huggingface");
+        g.hard.extend([
+            hugging_face.join("token"),
+            hugging_face.join("stored_tokens"),
+        ]);
+        // Claude Code keeps each project's memory notes beside its sessions. The rule that
+        // removes old sessions must never reach them. `~/.claude` is often a link into a
+        // dotfiles folder, and the sessions target uses the resolved path, so keep both.
+        let projects = h.join(".claude").join("projects");
+        g.claude_projects = std::fs::canonicalize(&projects)
+            .into_iter()
+            .chain([projects])
+            .collect();
+        g.claude_projects.dedup();
+        g.hard.extend(canonical_paths(never));
         anchors.sort();
         anchors.dedup();
         g.anchors = anchors;
@@ -1314,7 +1486,7 @@ impl Guard {
         {
             return Err("protected folder");
         }
-        if self.hard.iter().any(|d| path.starts_with(d)) {
+        if self.hard.iter().any(|d| path.starts_with(d)) || self.in_claude_memory(path) {
             return Err("protected file");
         }
         if self
@@ -1337,17 +1509,36 @@ impl Guard {
     pub fn walk_denied(&self, path: &Path) -> bool {
         self.hard.iter().any(|d| path.starts_with(d))
             || self.soft.iter().any(|d| path.starts_with(d))
+            || self.in_claude_memory(path)
     }
 
     /// Paths inside a tree that is being deleted that must be left alone.
     pub fn hard_denied(&self, path: &Path) -> bool {
-        self.hard.iter().any(|d| path.starts_with(d)) || is_ntuser(path)
+        self.hard.iter().any(|d| path.starts_with(d))
+            || is_ntuser(path)
+            || self.in_claude_memory(path)
     }
 
     /// True if a protected path, such as a Never touch item, is `path` or lies inside it.
     /// Moving or renaming `path` would move that item too.
     pub fn holds_hard(&self, path: &Path) -> bool {
         self.hard.iter().any(|d| d.starts_with(path))
+            || self.in_claude_memory(path)
+            || self
+                .claude_projects
+                .iter()
+                .any(|p| p.starts_with(path) || path.parent() == Some(p.as_path()))
+    }
+
+    /// True for `projects/<project>/memory` and anything inside it. Checked by shape, so it
+    /// costs the same for any number of projects and covers projects added later.
+    fn in_claude_memory(&self, path: &Path) -> bool {
+        self.claude_projects.iter().any(|p| {
+            path.strip_prefix(p)
+                .ok()
+                .and_then(|rest| rest.components().nth(1))
+                .is_some_and(|c| c.as_os_str() == "memory")
+        })
     }
 }
 
@@ -1415,6 +1606,7 @@ pub(crate) mod tests {
             keep: Vec::new(),
             note: "",
             watch_recent: false,
+            apps_only: false,
         }];
         let never = vec![env.home.join("Keep")];
         let g = Guard::new(&env, &targets, &never);
@@ -1451,6 +1643,130 @@ pub(crate) mod tests {
         assert!(g.holds_hard(&env.home), "a folder that holds it");
         assert!(!g.holds_hard(&env.home.join("Other")));
         assert!(!g.holds_hard(&env.home.join("Keep/a.bin")), "inside it");
+    }
+
+    #[test]
+    fn temp_folder_must_look_like_one() {
+        let (home, local) = (Path::new("/h"), Path::new("/h/AppData/Local"));
+        let keep = [home, local, Path::new("/h/Downloads")];
+        let ok = |dir: &str| is_temp_folder(Path::new(dir), local, &keep);
+        assert!(ok("/h/AppData/Local/Temp"));
+        assert!(ok("/h/AppData/Local/Temp/2"), "a remote session");
+        assert!(ok("/d/Temp") && ok("/d/tmp"));
+        assert!(!ok("/h"), "what Windows gives when TMP and TEMP are unset");
+        assert!(!ok("/"), "a drive root");
+        assert!(!ok("/h/AppData/Local") && !ok("/h/AppData"));
+        assert!(
+            !ok("/h/AppData/Local/Microsoft"),
+            "another LocalAppData folder"
+        );
+        assert!(!ok("/d/scratch"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_root_behind_a_link_is_not_used() {
+        let home = tempdir("root-link");
+        std::fs::create_dir_all(home.join("elsewhere/_cacache")).unwrap();
+        std::os::unix::fs::symlink(home.join("elsewhere"), home.join(".npm")).unwrap();
+        assert!(resolve_dir(&home.join(".npm/_cacache")).is_some());
+        assert!(
+            resolve_root(&home.join(".npm/_cacache")).is_none(),
+            "the link would lead the root elsewhere"
+        );
+        assert!(resolve_root(&home.join("elsewhere/_cacache")).is_some());
+    }
+
+    #[test]
+    fn guard_keeps_sync_folders_and_tool_data() {
+        let dir = tempdir("guard-data");
+        let mut env = env_in(&dir);
+        env.cloud = vec![env.home.join("Dropbox")];
+        let caches = env.local.join("Caches");
+        std::fs::create_dir_all(caches.join("JetBrains/IntelliJIdea2025.1/LocalHistory")).unwrap();
+        let g = Guard::new(&env, &[], &[]);
+        assert!(
+            g.hard_denied(&env.home.join("Dropbox/a.bin")),
+            "a sync folder"
+        );
+        if cfg!(target_os = "macos") {
+            let history = caches.join("JetBrains/IntelliJIdea2025.1/LocalHistory/changes");
+            assert!(g.hard_denied(&history), "an IDE's Local History");
+            assert!(g.hard_denied(&caches.join("deno/location_data/x/kv.sqlite3")));
+            assert!(!g.hard_denied(&caches.join("deno/deps")));
+        }
+    }
+
+    #[test]
+    fn guard_keeps_claude_code_memory_and_tokens() {
+        let dir = tempdir("guard-claude");
+        let env = env_in(&dir);
+        let project = env.home.join(".claude/projects/-Users-me-app");
+        std::fs::create_dir_all(project.join("memory")).unwrap();
+        let g = Guard::new(&env, &[], &[]);
+        assert!(g.hard_denied(&project.join("memory/MEMORY.md")));
+        assert!(!g.hard_denied(&project.join("session.jsonl")));
+        assert!(
+            !g.hard_denied(&project.join("a-session/memory")),
+            "only the project's own memory folder"
+        );
+        let later = env
+            .home
+            .join(".claude/projects/-Users-me-new/memory/MEMORY.md");
+        assert!(g.hard_denied(&later), "a project added after the scan");
+        assert!(
+            g.holds_hard(&project),
+            "renaming a project would move its memory"
+        );
+        let hugging_face = env.home.join(".cache/huggingface");
+        assert!(g.hard_denied(&hugging_face.join("token")), "a login token");
+        assert!(!g.hard_denied(&hugging_face.join("hub")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn guard_keeps_claude_code_memory_behind_a_link() {
+        let dir = tempdir("guard-claude-link");
+        let env = env_in(&dir);
+        // `~/.claude` links into a dotfiles folder; the sessions target resolves the link.
+        let real = env.home.join("dotfiles/claude");
+        std::fs::create_dir_all(real.join("projects/-Users-me-app/memory")).unwrap();
+        std::os::unix::fs::symlink(&real, env.home.join(".claude")).unwrap();
+        let resolved = resolve_dir(&env.home.join(".claude/projects")).unwrap();
+        assert!(resolved.starts_with(&real), "{resolved:?}");
+        let g = Guard::new(&env, &[], &[]);
+        assert!(g.hard_denied(&resolved.join("-Users-me-app/memory/MEMORY.md")));
+    }
+
+    #[test]
+    fn never_touch_paths_match_in_canonical_form() {
+        let dir = tempdir("guard-never");
+        let env = env_in(&dir);
+        std::fs::create_dir_all(env.home.join("Keep")).unwrap();
+        std::fs::create_dir_all(env.home.join("x")).unwrap();
+        // Typed by hand into settings.txt, not in the form the scan lists.
+        let typed = env.home.join("x/../Keep");
+        let g = Guard::new(&env, &[], &[typed]);
+        assert!(g.hard_denied(&env.home.join("Keep/a.bin")));
+    }
+
+    #[test]
+    fn finds_sync_folders_in_home() {
+        let home = tempdir("sync");
+        for name in ["Dropbox", "Dropbox (Acme)", "Box Sync", "Documents"] {
+            std::fs::create_dir_all(home.join(name)).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home.join("Documents"), home.join("OneDrive")).unwrap();
+        let names: Vec<String> = home_sync_folders(&home)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["Box Sync", "Dropbox", "Dropbox (Acme)"],
+            "a link is not a folder"
+        );
     }
 
     #[test]
@@ -1516,12 +1832,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tells_app_caches_from_tool_caches_by_name() {
+        for app in [
+            "com.spotify.client",
+            "com.microsoft.VSCode.ShipIt",
+            "org.Zellij-Contributors.Zellij",
+            "io.github.me.tool",
+        ] {
+            assert!(is_bundle_id(app), "{app}");
+        }
+        for tool in [
+            "gopls",
+            "copilot",
+            "cargo-xwin",
+            "Google",
+            "io.sentry",
+            "zoom.us",
+            "2.1.265",
+            "My App.v2.cache",
+        ] {
+            assert!(!is_bundle_id(tool), "{tool}");
+        }
+    }
+
+    #[test]
     fn filters_apple_names() {
         assert!(Filter::Apple.allows(OsStr::new("com.apple.Safari")));
         assert!(!Filter::Apple.allows(OsStr::new("com.spotify.client")));
         assert!(Filter::NotApple.allows(OsStr::new("com.spotify.client")));
         assert!(ext_in(
             OsStr::new("Photos Library.photoslibrary"),
+            INFO_ONLY_EXTS
+        ));
+        assert!(ext_in(
+            OsStr::new("iPhoto Library.photolibrary"),
             INFO_ONLY_EXTS
         ));
         assert!(!ext_in(OsStr::new("movie.mp4"), INFO_ONLY_EXTS));
